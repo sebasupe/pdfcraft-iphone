@@ -1,0 +1,61 @@
+name: Publicar PdfCraft para iPhone
+
+# Arma el sitio con el último release web oficial de PdfCraft y lo publica en GitHub Pages.
+# Corre todos los días: si salió una versión nueva, el iPhone la baja sola al abrir la app.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Pillow (íconos)
+        run: pip install pillow
+
+      - name: Bajar el último PdfCraft web oficial
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/descargar_web.py web
+
+      - name: Armar el sitio
+        run: python scripts/preparar.py web assets/pdfcraft-1024.png _site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      # GitHub apaga las tareas programadas de repos sin actividad en 60 días; esto la mantiene.
+      - name: Mantener activa la revisión diaria
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/publicar.yml/enable"
