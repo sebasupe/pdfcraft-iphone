@@ -10,66 +10,38 @@
     <meta name="apple-mobile-web-app-title" content="PdfCraft" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="format-detection" content="telephone=no" />
-    <meta name="theme-color" content="#f1f1f3" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#19191c" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
+    <link rel="stylesheet" href="./movil.css" />
     <style>
-      :root { --pc-bg: #f1f1f3; --pc-fg: #1d1d21; --pc-muted: #5d5d66; --pc-track: #dcdce2; --pc-accent: #b70228; }
-      @media (prefers-color-scheme: dark) {
-        :root { --pc-bg: #19191c; --pc-fg: #ececf1; --pc-muted: #a3a3ad; --pc-track: #34343a; --pc-accent: #e0435f; }
-      }
-      html, body {
-        margin: 0; height: 100%; overflow: hidden; background: var(--pc-bg);
-        overscroll-behavior: none; -webkit-text-size-adjust: 100%;
-        -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
-        -webkit-tap-highlight-color: transparent;
-      }
-      body {
-        box-sizing: border-box;
-        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
-      }
-      canvas { width: 100%; height: 100%; display: block; outline: none; touch-action: none; }
       #pc-splash {
-        position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+        position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column;
         align-items: center; justify-content: center; gap: 14px; padding: 24px;
-        background: var(--pc-bg); color: var(--pc-fg);
-        font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        transition: opacity .3s ease;
+        background: var(--bg); color: var(--fg); transition: opacity .3s ease;
       }
       #pc-splash.pc-out { opacity: 0; pointer-events: none; }
       #pc-splash img { width: 96px; height: 96px; border-radius: 22px; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
       #pc-splash h1 { margin: 6px 0 0; font-size: 22px; font-weight: 650; letter-spacing: -.01em; }
-      #pc-track { width: min(260px, 70vw); height: 6px; border-radius: 3px; background: var(--pc-track); overflow: hidden; }
-      #pc-bar { width: 2%; height: 100%; background: var(--pc-accent); transition: width .15s linear; }
-      #pc-status { color: var(--pc-muted); font-size: 14px; min-height: 1.4em; text-align: center; }
-      #pc-error { max-width: 320px; color: var(--pc-fg); font-size: 13px; text-align: center; white-space: pre-wrap; }
+      #pc-track { width: min(260px, 70vw); height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+      #pc-bar { width: 2%; height: 100%; background: var(--accent); transition: width .15s linear; }
+      #pc-status { color: var(--muted); font-size: 14px; min-height: 1.4em; text-align: center; }
+      #pc-error { max-width: 320px; color: var(--fg); font-size: 13px; text-align: center; white-space: pre-wrap; }
     </style>
     <script>
-      // Primera vez en una pantalla angosta (celular): interfaz un poco más compacta y los paneles
-      // laterales cerrados, para dejarle la pantalla al documento. Solo si PdfCraft todavía no
-      // guardó sus preferencias ("pdfcraft" en localStorage); luego se cambia en Preferencias.
+      // Primera vez: los paneles laterales de PdfCraft cerrados y sin buscar actualizaciones por
+      // su cuenta (la app se actualiza sola). El tamaño de la interfaz lo ajusta movil.js.
       window.pdfcraftSeedSettings = function () {
         try {
-          if (Math.min(screen.width, screen.height) > 600) return;
           if (localStorage.getItem("pdfcraft") !== null) return;
-          var seed = {
+          localStorage.setItem("pdfcraft", JSON.stringify({
             right_panel_closed: true,
             comments_panel_closed: true,
             update_check_at_start: false,
             side_panels: { rail_side: "right", side_width: 300, tools_open: false, tools_side: "left", tools_width: 260, version: 1 }
-          };
-          // "Tamaño de la interfaz" es absoluto (100% = 1 píxel de pantalla por punto); en un iPhone
-          // (3 píxeles por punto) 250% deja la interfaz al ~83% de su tamaño automático.
-          var dpr = window.devicePixelRatio || 1;
-          if (dpr >= 2) {
-            var presets = [75, 80, 85, 90, 95, 100, 125, 150, 175, 200, 250, 300];
-            var want = dpr * 83;
-            var best = presets.reduce(function (a, b) { return Math.abs(b - want) < Math.abs(a - want) ? b : a; });
-            seed.ui_scale = best / 100;
-          }
-          localStorage.setItem("pdfcraft", JSON.stringify(seed));
+          }));
         } catch (e) { /* sin almacenamiento: arranca con lo predeterminado */ }
       };
     </script>
@@ -83,8 +55,48 @@
       <div id="pc-status">Cargando…</div>
       <div id="pc-error" hidden></div>
     </div>
-    <canvas id="pdfcraft"></canvas>
+
+    <!-- Inicio: abrir, herramientas y archivos recientes -->
+    <section id="pc-home" class="pc-screen" aria-label="Inicio">
+      <header class="pc-home-head">
+        <img src="./icons/icon-192.png" alt="" />
+        <h1>Inicio</h1>
+        <button class="pc-round" id="pc-settings" type="button" aria-label="Ajustes"></button>
+      </header>
+      <main class="pc-home-body">
+        <button class="pc-open" id="pc-open" type="button">
+          <span data-icon="open"></span>
+          <span><b>Abrir un PDF</b><small>Desde Archivos, iCloud Drive u otra app</small></span>
+        </button>
+        <div class="pc-section"><h2>Herramientas</h2></div>
+        <div class="pc-tools" id="pc-tools"></div>
+        <div class="pc-section"><h2>Recientes</h2></div>
+        <ul class="pc-recents" id="pc-recents" aria-label="Archivos recientes"></ul>
+        <div class="pc-empty" id="pc-empty" hidden>
+          <div data-icon="file"></div>
+          Aquí aparecerán los PDF que abras. Se guardan en esta app junto con tus cambios.
+        </div>
+      </main>
+    </section>
+
+    <!-- Visor: el documento a pantalla completa con barras de celular -->
+    <section id="pc-viewer" class="pc-screen" aria-label="Documento">
+      <header class="pc-bar pc-top" id="pc-top"></header>
+      <div id="pc-doc">
+        <canvas id="pdfcraft" data-host="page"></canvas>
+        <div class="pc-shield" id="pc-shield" hidden></div>
+        <div class="pc-busy" id="pc-busy" hidden><div class="pc-spinner"></div><span id="pc-busy-text">Abriendo…</span></div>
+        <button class="pc-float pc-pill" id="pc-pill" type="button" aria-label="Ir a una página">1 / 1</button>
+        <button class="pc-float pc-fab" id="pc-fab" type="button" aria-label="Herramientas"></button>
+      </div>
+      <footer class="pc-bar pc-toolbar" id="pc-toolbar" hidden></footer>
+    </section>
+
+    <input type="file" id="pc-file" accept="application/pdf,.pdf" hidden />
+
     <script src="./iphone.js"></script>
+    <script src="./gestos.js"></script>
+    <script src="./movil.js"></script>
     <script type="module">
       import init, * as bindings from "./__GLUE__";
       const wasmResponse = await window.pdfcraftFetchWasm("./__WASM__", __WASM_BYTES__);

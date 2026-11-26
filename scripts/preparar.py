@@ -3,8 +3,8 @@
 Uso:
     python scripts/preparar.py <carpeta del release web> <icono 1024 png> <carpeta de salida>
 
-Copia el release sin modificarlo y le agrega: index.html para iPhone (pantalla de carga,
-pantalla completa), manifest.webmanifest, íconos, iphone.js y sw.js (instalación sin conexión y
+Copia el release sin modificarlo y le agrega: la interfaz para iPhone (index.html, movil.css,
+movil.js, gestos.js), manifest.webmanifest, íconos, iphone.js y sw.js (instalación sin conexión y
 actualización automática).
 """
 import hashlib
@@ -86,7 +86,10 @@ def main() -> None:
                 .replace("__WASM__", wasm.name)
                 .replace("__WASM_BYTES__", str(wasm.stat().st_size)))
     (salida / "index.html").write_text(html, encoding="utf-8")
-    shutil.copy2(PLANTILLA / "iphone.js", salida / "iphone.js")
+    # El resto de la plantilla (iphone.js, movil.js, movil.css…) va tal cual.
+    for f in sorted(PLANTILLA.iterdir()):
+        if f.is_file() and f.name not in ("index.html", "sw.js"):
+            shutil.copy2(f, salida / f.name)
 
     manifest = {
         "name": "PdfCraft",

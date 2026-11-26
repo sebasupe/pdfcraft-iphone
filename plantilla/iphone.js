@@ -1,8 +1,16 @@
 // PdfCraft para iPhone (app web instalada en la pantalla de inicio): pantalla de carga con
-// progreso, instalación sin conexión (service worker), actualización automática, tamaño de
-// interfaz para el celular y "Guardar" con la hoja de compartir de iOS.
+// progreso, instalación sin conexión (service worker), actualización automática y archivos que
+// PdfCraft guarda (a movil.js o a la hoja de compartir de iOS). La interfaz de celular está en movil.js.
 (function () {
   "use strict";
+
+  // La interfaz de celular maneja PdfCraft con su API de página (window.pdfcraft), que PdfCraft
+  // instala solo si la dirección lleva ?control al arrancar.
+  if (!/[?&]control(=|&|$)/.test(location.search)) {
+    try {
+      history.replaceState(history.state, "", location.pathname + (location.search ? location.search + "&control" : "?control") + location.hash);
+    } catch (e) { /* sin historial: queda la interfaz de escritorio */ }
+  }
 
   var splash = document.getElementById("pc-splash");
   var bar = document.getElementById("pc-bar");
@@ -25,18 +33,19 @@
     splash.classList.add("pc-out");
     setTimeout(function () { splash.hidden = true; }, 350);
   }
-  function toast(text) {
+  function toast(text, ms) {
     var el = document.createElement("div");
+    el.className = "pc-toast";
     el.setAttribute("role", "status");
     el.textContent = text;
-    el.style.cssText = "position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 24px);transform:translateX(-50%);" +
-      "z-index:20;max-width:min(360px,90vw);padding:10px 14px;border-radius:12px;background:rgba(30,30,34,.94);color:#fff;" +
-      "font:14px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.25);" +
-      "transition:opacity .4s ease;";
     document.body.appendChild(el);
-    setTimeout(function () { el.style.opacity = "0"; }, 7000);
-    setTimeout(function () { el.remove(); }, 7600);
+    ms = ms || 4000;
+    setTimeout(function () { el.style.opacity = "0"; }, ms);
+    setTimeout(function () { el.remove(); }, ms + 600);
   }
+  window.pdfcraftToast = toast;
+  // movil.js puede pedir que la pantalla de carga siga hasta tener lista su interfaz.
+  window.pdfcraftHideSplash = hideSplash;
 
   window.addEventListener("error", function (e) {
     var t = e && e.target;
@@ -68,7 +77,10 @@
       } else if (m.type === "install-failed") {
         installFailed = m.message || "error";
       } else if (m.type === "activated" && hadController) {
-        toast("PdfCraft " + (m.version || "") + " ya está descargado. Se usará la próxima vez que abras la app.");
+        // Versión nueva ya guardada en el teléfono: movil.js recarga cuando no hay nada abierto.
+        window.pdfcraftUpdateReady = true;
+        if (window.pdfcraftOnUpdate) window.pdfcraftOnUpdate();
+        else toast("Se descargó una actualización de PdfCraft. Se usará la próxima vez que abras la app.", 7000);
       }
     });
     sw.register("./sw.js", { scope: "./" }).then(function (reg) { registration = reg; }).catch(function (e) {
@@ -149,56 +161,75 @@
 
   window.addEventListener("TrunkApplicationStarted", function () {
     setStatus("Iniciando…");
-    setTimeout(hideSplash, 600);
+    if (!window.pdfcraftHoldSplash) setTimeout(hideSplash, 600);
   });
 
   // Tamaño de interfaz para el celular la primera vez (se cambia en Preferencias).
   window.pdfcraftSeedSettings && window.pdfcraftSeedSettings();
 
-  // --- iPhone/iPad: "Guardar" y "Exportar" abren la hoja de compartir ----------------------
-  // (Guardar en Archivos, AirDrop, Mail…). Si iOS no la permite, se descarga como siempre.
+  // --- Archivos que PdfCraft guarda o exporta ----------------------------------------------
+  // PdfCraft los entrega como descarga de un blob. Primero se ofrecen a movil.js
+  // (window.pdfcraftOnFile, para guardarlos en la app); si no los toma, en iPhone/iPad se abre la
+  // hoja de compartir (Guardar en Archivos, AirDrop, Mail…) y en otros equipos se descargan.
   var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  if (isIOS && navigator.share && navigator.canShare && typeof File === "function") {
-    var blobs = new Map();
-    var createURL = URL.createObjectURL.bind(URL);
-    var revokeURL = URL.revokeObjectURL.bind(URL);
-    var anchorClick = HTMLAnchorElement.prototype.click;
-    URL.createObjectURL = function (obj) {
-      var url = createURL(obj);
-      if (obj instanceof Blob) {
-        blobs.set(url, obj);
-        if (blobs.size > 16) blobs.delete(blobs.keys().next().value);
-      }
-      return url;
-    };
-    URL.revokeObjectURL = function (url) {
-      revokeURL(url);
-      setTimeout(function () { blobs.delete(url); }, 60000);
-    };
-    var types = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
-      txt: "text/plain", html: "text/html", json: "application/json", svg: "image/svg+xml",
-      docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", rtf: "application/rtf" };
-    HTMLAnchorElement.prototype.click = function () {
-      var blob = this.download ? blobs.get(this.href) : null;
-      if (!blob) return anchorClick.call(this);
-      var name = this.download;
-      var ext = (name.split(".").pop() || "").toLowerCase();
-      var file = new File([blob], name, { type: blob.type || types[ext] || "application/octet-stream" });
-      var ok = false;
-      try { ok = navigator.canShare({ files: [file] }); } catch (e) { ok = false; }
-      if (!ok) return anchorClick.call(this);
-      navigator.share({ files: [file] }).catch(function (err) {
-        if (err && err.name === "AbortError") return; // se cerró la hoja sin elegir
-        var a = document.createElement("a");
-        a.href = createURL(blob);
-        a.download = name;
-        document.body.appendChild(a);
-        anchorClick.call(a);
-        a.remove();
-        setTimeout(function () { revokeURL(a.href); }, 60000);
-      });
-    };
+  var blobs = new Map();
+  var createURL = URL.createObjectURL.bind(URL);
+  var revokeURL = URL.revokeObjectURL.bind(URL);
+  var anchorClick = HTMLAnchorElement.prototype.click;
+  var types = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+    txt: "text/plain", html: "text/html", json: "application/json", svg: "image/svg+xml",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", rtf: "application/rtf" };
+  URL.createObjectURL = function (obj) {
+    var url = createURL(obj);
+    if (obj instanceof Blob) {
+      blobs.set(url, obj);
+      if (blobs.size > 16) blobs.delete(blobs.keys().next().value);
+    }
+    return url;
+  };
+  URL.revokeObjectURL = function (url) {
+    revokeURL(url);
+    setTimeout(function () { blobs.delete(url); }, 60000);
+  };
+  function download(blob, name) {
+    var a = document.createElement("a");
+    a.href = createURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    anchorClick.call(a);
+    a.remove();
+    setTimeout(function () { revokeURL(a.href); }, 60000);
   }
+  // Comparte un archivo; si iOS no lo permite (p. ej. sin un toque reciente), devuelve false.
+  window.pdfcraftShareFile = async function (file) {
+    if (!(isIOS && navigator.share && navigator.canShare)) { download(file, file.name); return true; }
+    var ok = false;
+    try { ok = navigator.canShare({ files: [file] }); } catch (e) { ok = false; }
+    if (!ok) { download(file, file.name); return true; }
+    try {
+      await navigator.share({ files: [file] });
+      return true;
+    } catch (err) {
+      if (err && err.name === "AbortError") return true; // se cerró la hoja sin elegir
+      if (err && err.name === "NotAllowedError") return false;
+      download(file, file.name);
+      return true;
+    }
+  };
+  HTMLAnchorElement.prototype.click = function () {
+    var blob = this.download ? blobs.get(this.href) : null;
+    if (!blob) return anchorClick.call(this);
+    var name = this.download;
+    var ext = (name.split(".").pop() || "").toLowerCase();
+    var file = new File([blob], name, { type: blob.type || types[ext] || "application/octet-stream" });
+    try {
+      if (window.pdfcraftOnFile && window.pdfcraftOnFile(file)) return;
+    } catch (e) { console.warn("PdfCraft: pdfcraftOnFile", e); }
+    window.pdfcraftShareFile(file).then(function (done) {
+      if (!done && window.pdfcraftOfferShare) window.pdfcraftOfferShare(file);
+      else if (!done) download(file, name);
+    });
+  };
 })();
