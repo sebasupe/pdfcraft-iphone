@@ -126,6 +126,7 @@ def main() -> None:
         huella.update((salida / rel[2:]).read_bytes())
     huella.update(html.encode("utf-8"))
     sw = (PLANTILLA / "sw.js").read_text(encoding="utf-8")
+    huella.update(sw.encode("utf-8"))
     sw = (sw.replace("__VERSION__", build + "-" + huella.hexdigest()[:10])
             .replace("__PDFCRAFT__", pdfcraft)
             .replace("__WASM__", wasm.name)

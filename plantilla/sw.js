@@ -36,12 +36,26 @@ async function fetchWasm() {
   return new Response(new Blob(chunks, { type: "application/wasm" }), { headers: { "Content-Type": "application/wasm" } });
 }
 
+// Los archivos de PdfCraft llevan su huella en el nombre (pdfcraft-web-<hash>_bg.wasm…): si una
+// versión anterior ya los guardó, no cambiaron y no se vuelven a bajar.
+const HASHED = /-[0-9a-f]{16}(_bg|_loader)?\.(wasm|js)$/;
+async function reuse(cache, url) {
+  if (!HASHED.test(url)) return false;
+  const old = await caches.match(url);
+  if (!old) return false;
+  await cache.put(url, old);
+  return true;
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
-    const rest = PRECACHE.filter((url) => url !== WASM);
+    const rest = [];
+    for (const url of PRECACHE) {
+      if (url !== WASM && !(await reuse(cache, url))) rest.push(url);
+    }
     await cache.addAll(rest.map((url) => new Request(url, { cache: "reload" })));
-    await cache.put(WASM, await fetchWasm());
+    if (!(await reuse(cache, WASM))) await cache.put(WASM, await fetchWasm());
     await self.skipWaiting();
   })().catch((error) => {
     broadcast({ type: "install-failed", message: String((error && error.message) || error) });
