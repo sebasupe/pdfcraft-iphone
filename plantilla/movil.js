@@ -412,6 +412,10 @@
       setDirty(!!active.dirty);
       updatePill(s);
       if (!S.desktop && !S.modal) syncTool(s);
+      if (!S.desktop && !S.modal && S.mode !== "organizar" && gestures && !gestures.busy() && Date.now() - (S.recenteredAt || 0) > 1000) {
+        S.recenteredAt = Date.now();
+        await recenter(s);
+      }
       if (S.mode === "organizar" && s.active && !s.active.organize && !S.modal) exitMode();
       if (S.searching && s.active && !s.active.find_open && Date.now() - S.searchOpenedAt > 1500) closeSearch(false);
       else if (S.searching && s.active && s.active.find_open) await readFind();
@@ -709,10 +713,10 @@
     setTimeout(() => canvas.dispatchEvent(new MouseEvent("mouseleave", { clientX: -1, clientY: -1 })), 300);
   }
 
-  // Al cambiar el tamaño de la interfaz PdfCraft conserva el corrimiento horizontal: si la página
-  // cabe a lo ancho, se vuelve a centrar.
-  async function recenter() {
-    const s = await pc.state();
+  // Si la página cabe a lo ancho, queda centrada, como en iOS. PdfCraft deja márgenes laterales
+  // anchos y la corre al cambiar el tamaño de la interfaz o al saltar a un resultado de búsqueda.
+  async function recenter(state) {
+    const s = state || (await pc.state());
     const a = s.active;
     if (!a || a.organize || !a.pages_on_screen || !a.pages_on_screen.length) return;
     const vw = a.viewport[2] - a.viewport[0];
@@ -720,7 +724,7 @@
     const pw = p[2] - p[0];
     if (pw > vw + 1) return;
     const dx = p[0] - (a.viewport[0] + (vw - pw) / 2);
-    if (Math.abs(dx) >= 1) scrollDoc(dx, 0);
+    if (Math.abs(dx) >= 2) scrollDoc(dx, 0);
   }
 
   let resizeTimer = null;

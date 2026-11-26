@@ -275,7 +275,7 @@
     for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel", "gesturestart", "gesturechange", "gestureend"]) {
       window.addEventListener(type, block, active);
     }
-    return { stop: () => { stopFling(); fire.leave(); } };
+    return { stop: () => { stopFling(); fire.leave(); }, busy: () => !!(g || fling) };
   }
 
   window.pdfcraftGestures = { attach };
