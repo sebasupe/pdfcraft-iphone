@@ -31,6 +31,56 @@
       #pc-error { max-width: 320px; color: var(--fg); font-size: 13px; text-align: center; white-space: pre-wrap; }
     </style>
     <script>
+      (function () {
+        try {
+          var raw = JSON.parse(localStorage.getItem("pdfcraft-movil") || "{}");
+          var calidad = raw.calidad || "fluida";
+          var realDpr = window.devicePixelRatio || 1;
+          window.__pdfcraftNativeDpr = realDpr;
+          var cap = calidad === "maxima" ? realDpr : calidad === "rapida" ? 1.5 : 2;
+          var target = Math.min(realDpr, cap);
+          window.__pdfcraftActiveDpr = target;
+          if (realDpr > target + 0.01) {
+            Object.defineProperty(window, "devicePixelRatio", { get: function () { return target; }, configurable: true });
+            if (typeof ResizeObserverEntry !== "undefined" && typeof ResizeObserverSize !== "undefined") {
+              var dpDesc = Object.getOwnPropertyDescriptor(ResizeObserverEntry.prototype, "devicePixelContentBoxSize");
+              var inDesc = Object.getOwnPropertyDescriptor(ResizeObserverSize.prototype, "inlineSize");
+              var blDesc = Object.getOwnPropertyDescriptor(ResizeObserverSize.prototype, "blockSize");
+              if (dpDesc && dpDesc.get && inDesc && inDesc.get && blDesc && blDesc.get) {
+                var dpGet = dpDesc.get, inGet = inDesc.get, blGet = blDesc.get;
+                var scaled = new WeakMap();
+                Object.defineProperty(ResizeObserverEntry.prototype, "devicePixelContentBoxSize", {
+                  configurable: true,
+                  get: function () {
+                    var arr = dpGet.call(this);
+                    if (arr && arr.length) {
+                      var css = this.contentBoxSize;
+                      var k = target / realDpr;
+                      for (var i = 0; i < arr.length; i++) {
+                        if (css && css.length) {
+                          var c = css[Math.min(i, css.length - 1)];
+                          scaled.set(arr[i], [Math.max(1, Math.round(inGet.call(c) * target)), Math.max(1, Math.round(blGet.call(c) * target))]);
+                        } else {
+                          scaled.set(arr[i], [Math.max(1, Math.round(inGet.call(arr[i]) * k)), Math.max(1, Math.round(blGet.call(arr[i]) * k))]);
+                        }
+                      }
+                    }
+                    return arr;
+                  },
+                });
+                Object.defineProperty(ResizeObserverSize.prototype, "inlineSize", {
+                  configurable: true,
+                  get: function () { var s = scaled.get(this); return s ? s[0] : inGet.call(this); },
+                });
+                Object.defineProperty(ResizeObserverSize.prototype, "blockSize", {
+                  configurable: true,
+                  get: function () { var s = scaled.get(this); return s ? s[1] : blGet.call(this); },
+                });
+              }
+            }
+          }
+        } catch (e) {}
+      })();
       window.pdfcraftSeedSettings = function () {
         try {
           if (localStorage.getItem("pdfcraft") !== null) return;

@@ -132,6 +132,7 @@
   const MIN_DIALOG_SIZE = 0.58;
   const prefs = Object.assign({
     tamano: "grande",
+    calidad: "fluida",      // "fluida" (2x) | "rapida" (1.5x) | "maxima" (nativa 3x)
     nombre: "",
     tema: "auto",
     lectura: "normal",   // "normal" | "noche" | "sepia"
@@ -141,6 +142,7 @@
     orden: "reciente",      // "reciente" | "nombre" | "tamano"
   }, readPrefs());
   if (!SIZES[prefs.tamano]) prefs.tamano = "grande";
+  if (!/^(fluida|rapida|maxima)$/.test(prefs.calidad)) prefs.calidad = "fluida";
   function readPrefs() { try { return JSON.parse(localStorage.getItem(PREFS_KEY) || "{}"); } catch (e) { return {}; } }
   function savePrefs() { try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch (e) {} }
   function applyThemeAttr() {
@@ -285,6 +287,8 @@
     navHistoryUsed: false,
     scrubbing: false,
     orgSelCount: 0,
+    scrollHand: false,
+    scrollRestoreTimer: null,
   };
 
   // ---------- Eventos del modo anfitrión ----------
@@ -413,12 +417,50 @@
     const quiet = (p) => p.catch(() => {});
     quiet(pc.set("show_page_edge_shadows", "false"));
     quiet(pc.set("comment-tool-pinned", "true"));
+    quiet(pc.set("animation_effects", "off"));
+    quiet(pc.set("text-links", "false"));
     if (prefs.nombre) quiet(pc.set("author", prefs.nombre));
     if (prefs.tema !== "auto") quiet(pc.run(prefs.tema === "oscuro" ? "view.theme.dark" : "view.theme.light"));
+
+    // Durante el desplazamiento/pellizco en lectura normal se activa "hand" para que PdfCraft
+    // no extraiga capas de texto en cada página que pasa rápido (evita tirones en el hilo WASM).
+    function enterScrollHand() {
+      clearTimeout(S.scrollRestoreTimer);
+      if (!S.doc || S.mode || S.searching || S.tool || S.modal || S.desktop || S.panel) return;
+      if (S.scrollHand) return;
+      S.scrollHand = true;
+      S.toolSetAt = Date.now();
+      pc.set("quick", "hand").catch(() => {});
+    }
+    function restoreSelectNow() {
+      clearTimeout(S.scrollRestoreTimer);
+      if (!S.scrollHand) return;
+      S.scrollHand = false;
+      if (!S.tool && !S.mode && !S.modal && !S.desktop && !S.panel && S.ready) {
+        S.toolSetAt = Date.now();
+        pc.set("quick", BASE_TOOL).catch(() => {});
+      }
+    }
+    function scheduleRestoreSelect() {
+      clearTimeout(S.scrollRestoreTimer);
+      S.scrollRestoreTimer = setTimeout(() => {
+        if (gestures && gestures.busy()) return;
+        restoreSelectNow();
+        tick();
+      }, 170);
+    }
+    S.restoreSelectNow = restoreSelectNow;
 
     gestures = window.pdfcraftGestures && window.pdfcraftGestures.attach(canvas, {
       mode: () => (S.desktop ? "raton-zoom" : (S.modal || S.panel) ? "raton" : S.tool ? "herramienta" : "ver"),
       ratio: () => S.ratio,
+      zoomBounds: () => {
+        const a = S.last && S.last.active;
+        const cur = (a && a.zoom_percent) || S.fitZoom || 100;
+        const minZ = Math.max(12, (S.fitZoom || 45) * 0.6);
+        const maxZ = 600;
+        return [Math.max(0.2, minZ / cur), Math.min(5.0, maxZ / cur)];
+      },
       singlePage: () => {
         const a = S.last && S.last.active;
         if (!a || a.continuous !== false || a.organize || !a.pages_on_screen || !a.pages_on_screen.length) return false;
@@ -426,9 +468,22 @@
         const p = a.pages_on_screen[0].rect;
         return (p[2] - p[0]) <= vw + 6;
       },
+      onTouchStart: (stoppedFling) => {
+        clearTimeout(S.scrollRestoreTimer);
+        if (!stoppedFling && S.scrollHand) restoreSelectNow();
+      },
+      onScrollStart: enterScrollHand,
+      onScrollEnd: () => {
+        scheduleRestoreSelect();
+        setTimeout(() => { if (!gestures || !gestures.busy()) tick(); }, 50);
+      },
+      onPinchEnd: () => {
+        scheduleRestoreSelect();
+        setTimeout(() => { if (!gestures || !gestures.busy()) tick(); }, 90);
+      },
       onSwipePage: (dir) => stepPage(dir),
       onDoubleTap: (x, y) => toggleDoubleTapZoom(x, y),
-      onTap: () => { hideSelectionBar(); },
+      onTap: () => { restoreSelectNow(); hideSelectionBar(); },
       onSingleTap: () => {
         if (!S.doc || S.mode || S.searching || S.modal || S.desktop || S.panel) return;
         const a = S.last && S.last.active;
@@ -436,6 +491,7 @@
         setImmersive(!S.immersive);
       },
       onLongPress: (x, y) => {
+        restoreSelectNow();
         hideSelectionBar();
         showPressRing(x, y);
         if (navigator.vibrate) try { navigator.vibrate(14); } catch (e) {}
@@ -447,7 +503,7 @@
     await reloadLibrary();
     renderShell();
     if (window.pdfcraftHideSplash) window.pdfcraftHideSplash();
-    setInterval(tick, 300);
+    setInterval(tick, 500);
     document.addEventListener("visibilitychange", () => {
       syncWakeLock();
       if (document.visibilityState === "hidden" && S.doc) {
@@ -569,6 +625,7 @@
   // ---------- Estado periódico ----------
   async function tick() {
     if (!S.ready || S.polling || document.visibilityState !== "visible") return;
+    if (gestures && gestures.busy()) return;
     S.polling = true;
     try {
       const s = await pc.state();
@@ -714,7 +771,7 @@
   }
 
   function syncTool(s) {
-    if (Date.now() - S.toolSetAt < 1500) return;
+    if (S.scrollHand || Date.now() - S.toolSetAt < 1500) return;
     const q = s.quick_tool;
     if (S.tool && q !== S.tool) {
       S.tool = q === BASE_TOOL || q === "hand" ? null : q;
@@ -1859,6 +1916,7 @@
   }
 
   function scrollDoc(dx, dy) {
+    if (Math.abs(dx) < 0.05 && Math.abs(dy) < 0.05) return;
     const r = canvas.getBoundingClientRect();
     const x = r.left + r.width / 2, y = r.top + r.height / 2;
     const active = document.activeElement;
@@ -1866,9 +1924,8 @@
       canvas.focus({ preventScroll: true });
     }
     canvas.dispatchEvent(new MouseEvent("mousemove", { clientX: x, clientY: y, bubbles: true }));
-    const n = Math.ceil(Math.hypot(dx, dy) / 7);
-    for (let i = 0; i < n; i++) canvas.dispatchEvent(new WheelEvent("wheel", { clientX: x, clientY: y, deltaX: dx / n, deltaY: dy / n, deltaMode: 0, bubbles: true, cancelable: true }));
-    setTimeout(() => canvas.dispatchEvent(new MouseEvent("mouseleave", { clientX: -1, clientY: -1 })), 260);
+    canvas.dispatchEvent(new WheelEvent("wheel", { clientX: x, clientY: y, deltaX: dx, deltaY: dy, deltaMode: 0, bubbles: true, cancelable: true }));
+    setTimeout(() => canvas.dispatchEvent(new MouseEvent("mouseleave", { clientX: -1, clientY: -1 })), 140);
   }
 
   async function recenter(state) {
@@ -1903,6 +1960,7 @@
 
   async function closeAll() {
     clearTimeout(S.thumbTimer);
+    if (S.restoreSelectNow) S.restoreSelectNow();
     if (S.panel) await closePanel();
     if (S.mode) await exitMode();
     if (S.searching) closeSearch();
@@ -2103,6 +2161,7 @@
   // ---------- Búsqueda ----------
   function openSearch() {
     if (!S.doc) return;
+    if (S.restoreSelectNow) S.restoreSelectNow();
     setImmersive(false);
     if (S.mode) exitMode();
     if (S.panel) closePanel();
@@ -2371,6 +2430,7 @@
   async function enterMode(name) {
     const m = MODES[name];
     if (!m || !S.doc) return;
+    if (S.restoreSelectNow) S.restoreSelectNow();
     setImmersive(false);
     if (S.panel) await closePanel();
     if (S.mode) await exitMode();
@@ -2767,6 +2827,21 @@
         }),
         h("div", { class: "pc-label", text: "Modo de lectura predeterminado" }),
         seg("lectura", [["normal", "Normal"], ["noche", "Noche"], ["sepia", "Sepia"]], () => applyReadingVisuals()),
+        h("div", { class: "pc-label", text: "Fluidez y calidad del visor" }),
+        seg("calidad", [["fluida", "Fluida (2×)"], ["rapida", "Ultra rápida"], ["maxima", "Máxima (3×)"]], (v) => {
+          const realDpr = window.__pdfcraftNativeDpr || window.devicePixelRatio || 1;
+          const wanted = Math.min(realDpr, v === "maxima" ? realDpr : v === "rapida" ? 1.5 : 2);
+          const current = window.__pdfcraftActiveDpr || realDpr;
+          if (Math.abs(wanted - current) > 0.01) {
+            if (!S.doc) {
+              close();
+              toast("Aplicando nuevo modo de fluidez…", 1800);
+              setTimeout(() => location.reload(), 320);
+            } else {
+              toast("Se aplicará al volver a Inicio y reabrir.", 4000);
+            }
+          }
+        }),
         h("div", { class: "pc-label", text: "Tamaño de diálogos de PdfCraft" }),
         seg("tamano", [["pequeno", "Pequeño"], ["mediano", "Mediano"], ["grande", "Grande"]], () => applyScale().catch(() => {})),
         h("div", { class: "pc-label", text: "Tu nombre (comentarios y firmas)" }),

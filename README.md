@@ -26,7 +26,7 @@ inspirada en la experiencia móvil de Adobe Acrobat (con el emblema e identidad 
 - **Botón `+`:** abre un PDF desde Archivos/iCloud, escanea o convierte fotos de la cámara/galería a PDF multipágina (con filtros de documento y blanco y negro), combina varios PDF o crea uno en blanco.
 
 **Visor inmersivo para iPhone**
-- **Gestos nativos:** deslizar con inercia, pellizcar para acercar/alejar, **doble toque** para acercar/ajustar al ancho, **toque simple** para ocultar/mostrar las barras en lectura a pantalla completa, **deslizar horizontal** para pasar páginas en modo Página única y **pulsación larga** con anillo visual para seleccionar texto (Copiar, Resaltar, Subrayar, Tachar, Nota).
+- **Gestos nativos de alto rendimiento:** pellizco acelerado por GPU (sin tirones al acercar/alejar), desplazamiento agrupado a 60/120 Hz con inercia estilo iOS, renderizado inteligente a 2× Retina (configurable en Ajustes), **doble toque** para acercar/ajustar al ancho, **toque simple** para ocultar/mostrar las barras en lectura a pantalla completa, **deslizar horizontal** para pasar páginas en modo Página única y **pulsación larga** con anillo visual para seleccionar texto (Copiar, Resaltar, Subrayar, Tachar, Nota).
 - **Barra inferior de lectura:** acceso en un toque a **Páginas**, **Marcadores e índice**, **Comentar**, **Firmar** y **Herramientas**, junto con un **deslizador rápido de páginas** para saltar por libros extensos.
 - **Ajustes de vista:** Continuo / Página única / Dos páginas, **Modo noche**, **Sepia**, control de brillo de lectura, rotar vista y **Mantener pantalla encendida**.
 - **Paneles integrados:** índice/tabla de contenidos del PDF, tus marcadores personales, lista de comentarios, capas, adjuntos y firmas digitales.
