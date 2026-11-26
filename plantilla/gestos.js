@@ -1,33 +1,31 @@
-// PdfCraft para iPhone: gestos de iOS sobre el lienzo de PdfCraft.
+// PdfCraft para iPhone: gestos nativos de iOS sobre el lienzo de PdfCraft.
 //
-// PdfCraft (egui) trata el dedo como un ratón: arrastrar selecciona texto en vez de desplazar, no
-// hay inercia y el teclado solo aparece al segundo toque. Aquí se capturan los toques reales del
-// lienzo (en window, fase de captura, antes que eframe) y se traducen a lo que PdfCraft entiende:
-//   · un dedo que se desliza → rueda (desplazamiento) con inercia al soltar;
-//   · dos dedos → Ctrl+rueda (zoom con el factor exacto del pellizco) y rueda (desplazamiento);
-//   · un toque → clic (pointerdown + pointerup), que eframe procesa en el mismo momento, así el
-//     campo de texto toma el foco dentro del toque y iOS muestra el teclado;
-//   · pulsación larga y arrastre → arrastre con el botón apretado (seleccionar texto, mover páginas).
-// Con una herramienta elegida (resaltar, dibujar…) arrastrar con un dedo usa la herramienta, y en
-// los diálogos o la interfaz completa se arrastra como con el ratón.
+// Traduce los dedos reales a eventos que PdfCraft (egui/eframe) entiende:
+//   · un dedo que desliza → desplazamiento suave con inercia estilo iOS;
+//   · deslizar horizontal en modo Página única → pasar a página siguiente/anterior;
+//   · dos dedos → pellizco para acercar/alejar (Ctrl+rueda) + desplazamiento simultáneo;
+//   · doble toque → acercar/ajustar al ancho centrado donde se tocó;
+//   · un toque → clic síncrono dentro del toque (para abrir el teclado de iOS al 1er toque en campos)
+//     y aviso onSingleTap (para ocultar/mostrar barras en modo lectura si no se abrió texto);
+//   · pulsación larga (420 ms) y arrastre → seleccionar texto o mover páginas con anillo visual.
 (function () {
   "use strict";
 
-  const SLOP = 8;          // px que se puede mover un toque sin dejar de ser toque
-  const LONG_PRESS = 450;  // ms de la pulsación larga
-  const WHEEL_STEP = 7;    // puntos por evento de rueda: egui aplica al momento los menores de 8
-  const ZOOM_K = 100;      // eframe: factor de zoom = exp(-0.01 · deltaY) cuando viene con Ctrl
-  const DECAY = 0.9975;    // frenado de la inercia por milisegundo (parecido a iOS)
+  const SLOP = 8;
+  const LONG_PRESS = 420;
+  const DOUBLE_TAP_MS = 290;
+  const DOUBLE_TAP_DIST = 36;
+  const WHEEL_STEP = 7;
+  const ZOOM_K = 100;
+  const DECAY = 0.9975;
 
   function attach(canvas, opts) {
-    // opts.mode(): "ver" | "herramienta" | "raton" | "raton-zoom" (ratón con pellizco)
-    // opts.ratio(): px de pantalla (CSS) por punto de PdfCraft
-    // opts.onTap(x, y), opts.onSelectEnd(x, y), opts.onPinchEnd(): avisos opcionales
-    let g = null;        // gesto en curso
-    let fling = null;    // inercia en curso
+    let g = null;
+    let fling = null;
     let hovering = false;
+    let lastTap = { t: 0, x: 0, y: 0 };
+    let singleTapTimer = null;
 
-    // ---- Eventos que recibe eframe (no son "de confianza": isTrusted = false) ----
     const fire = {
       move(x, y, buttons) {
         canvas.dispatchEvent(new MouseEvent("mousemove", { clientX: x, clientY: y, buttons: buttons || 0, bubbles: true, cancelable: true }));
@@ -49,7 +47,6 @@
       },
     };
 
-    // Mueve el contenido (dx, dy) px de pantalla, en pasos pequeños para que egui no los suavice.
     function scrollBy(dx, dy, x, y) {
       const r = opts.ratio() || 1;
       const px = -dx / r, py = -dy / r;
@@ -58,10 +55,11 @@
     }
     function zoomBy(factor, x, y) {
       if (!(factor > 0) || Math.abs(Math.log(factor)) < 0.002) return;
+      ensureFocus();
+      fire.move(x, y);
       fire.wheel(x, y, 0, -ZOOM_K * Math.log(factor), true);
     }
 
-    // ---- Toques reales ----
     const onCanvas = (list) => Array.prototype.filter.call(list, (t) => t.target === canvas);
     const find = (list, id) => Array.prototype.find.call(list, (t) => t.identifier === id);
     const pair = (a, b) => ({ x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2, d: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) });
@@ -88,8 +86,6 @@
       fling.raf = requestAnimationFrame(step);
     }
 
-    // Velocidad del dedo (px/ms) al soltarlo: entre el último movimiento y el más viejo de los
-    // últimos 150 ms (o el anterior, si los movimientos llegan espaciados). 0 si el dedo se detuvo.
     function velocity(s, now) {
       if (s.length < 2) return [0, 0];
       const b = s[s.length - 1];
@@ -102,16 +98,13 @@
       return [cap((b[1] - a[1]) / Math.max(8, dt)), cap((b[2] - a[2]) / Math.max(8, dt))];
     }
 
-    // El campo de texto oculto de eframe (el que recibe el teclado) tiene el foco.
     function typing() {
       const active = document.activeElement;
-      return !!(active && active.tagName === "INPUT" && canvas.parentNode && canvas.parentNode.contains(active));
+      if (!active || active === document.body || active === canvas) return false;
+      const isField = active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable;
+      return !!(isField && canvas.parentNode && canvas.parentNode.contains(active));
     }
 
-    // Clic dentro del toque real. Cada pointerup hace que eframe procese al momento; si el clic
-    // abre un campo de texto (de un formulario, una nota…), PdfCraft lo enfoca una o dos pasadas
-    // después, ya fuera del toque, y iOS no mostraría el teclado. Por eso se fuerzan hasta dos
-    // pasadas más con pointerup sueltos (egui no los cuenta como clic: no hay botón apretado).
     function click(x, y) {
       fire.move(x, y);
       fire.down(x, y);
@@ -119,9 +112,6 @@
       for (let i = 0; i < 2 && !typing(); i++) fire.up(x, y);
     }
 
-    // PdfCraft ignora la rueda si su lienzo no tiene el foco (p. ej. tras tocar un botón de la
-    // interfaz). El campo de texto oculto de eframe (hermano del lienzo) también cuenta como foco:
-    // si se está escribiendo, no se le quita.
     function ensureFocus() {
       const active = document.activeElement;
       if (active === canvas) return;
@@ -145,20 +135,24 @@
       const now = performance.now();
       const stopped = stopFling();
       if (mine.length >= 2) {
+        clearTimeout(singleTapTimer);
         if (g && g.timer) clearTimeout(g.timer);
-        // El primer dedo estaba arrastrando: se suelta donde estaba.
         if (g && (g.kind === "drag" || g.kind === "press")) fire.up(g.x, g.y);
         startPinch(mine[0], mine[1], g ? g.mode : opts.mode());
         return;
       }
       if (g) return;
       const t = mine[0];
-      g = { kind: "pending", mode: opts.mode(), id: t.identifier, x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, t0: now, s: [[now, t.clientX, t.clientY]], stopped, lock: null };
+      g = {
+        kind: "pending", mode: opts.mode(), id: t.identifier,
+        x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY,
+        t0: now, s: [[now, t.clientX, t.clientY]], stopped, lock: null, pageSwipe: false,
+      };
       if (g.mode === "ver" && !stopped) {
         const mineG = g;
         g.timer = setTimeout(() => {
           if (g !== mineG || g.kind !== "pending") return;
-          g.kind = "press"; // pulsación larga: se aprieta el botón donde está el dedo
+          g.kind = "press";
           fire.move(g.x0, g.y0);
           fire.down(g.x0, g.y0);
           if (opts.onLongPress) opts.onLongPress(g.x0, g.y0);
@@ -176,7 +170,7 @@
         if (!a || !b) return;
         const p = pair(a, b);
         if (g.mode !== "raton") {
-          fire.move(p.x, p.y); // el zoom se centra en el puntero
+          fire.move(p.x, p.y);
           zoomBy(p.d / (g.d || p.d), p.x, p.y);
         }
         scrollBy(p.x - g.x, p.y - g.y, p.x, p.y);
@@ -195,8 +189,9 @@
           g.kind = "pan";
           const dx = Math.abs(x - g.x0), dy = Math.abs(y - g.y0);
           g.lock = dy > 2 * dx ? "y" : dx > 2 * dy ? "x" : null;
+          g.pageSwipe = !!(g.lock === "x" && opts.singlePage && opts.singlePage());
           g.x = g.x0; g.y = g.y0;
-          fire.move(g.x0, g.y0); // la rueda va a lo que está bajo el puntero
+          if (!g.pageSwipe) fire.move(g.x0, g.y0);
         } else {
           g.kind = "drag";
           g.x = g.x0; g.y = g.y0;
@@ -205,9 +200,11 @@
         }
       }
       if (g.kind === "pan") {
-        scrollBy(g.lock === "y" ? 0 : x - g.x, g.lock === "x" ? 0 : y - g.y, g.x0, g.y0);
+        if (!g.pageSwipe) {
+          scrollBy(g.lock === "y" ? 0 : x - g.x, g.lock === "x" ? 0 : y - g.y, g.x0, g.y0);
+        }
       } else {
-        fire.move(x, y, 1); // "drag" o "press": arrastre con el botón apretado
+        fire.move(x, y, 1);
       }
       g.x = x; g.y = y;
     }
@@ -224,9 +221,8 @@
       if (g.kind === "pinch") {
         const rest = onCanvas(e.touches);
         if (rest.length === 1 && !cancelled) {
-          // Queda un dedo: sigue desplazando, sin inercia.
           const t = rest[0];
-          g = { kind: "pan", mode: g.mode, id: t.identifier, x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, s: [], lock: null, noFling: true };
+          g = { kind: "pan", mode: g.mode, id: t.identifier, x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, s: [], lock: null, noFling: true, fromPinch: true };
           return;
         }
         g = null;
@@ -241,16 +237,46 @@
       g = null;
       if (was.kind === "pending") {
         if (!was.stopped && !cancelled) {
-          // Un toque: clic donde empezó (el dedo suele correrse un poco al levantarlo).
+          const now = performance.now();
+          const isDouble = was.mode === "ver" && (now - lastTap.t) < DOUBLE_TAP_MS &&
+            Math.hypot(was.x0 - lastTap.x, was.y0 - lastTap.y) < DOUBLE_TAP_DIST;
+          if (isDouble && opts.onDoubleTap) {
+            clearTimeout(singleTapTimer);
+            lastTap = { t: 0, x: 0, y: 0 };
+            opts.onDoubleTap(was.x0, was.y0);
+            setTimeout(() => fire.leave(), 120);
+            return;
+          }
+          // Clic síncrono dentro de touchend para que Safari muestre el teclado al 1er toque.
           click(was.x0, was.y0);
           if (opts.onTap) opts.onTap(was.x0, was.y0);
+          if (was.mode === "ver") {
+            lastTap = { t: now, x: was.x0, y: was.y0 };
+            clearTimeout(singleTapTimer);
+            const tapX = was.x0, tapY = was.y0;
+            if (opts.onSingleTap) {
+              singleTapTimer = setTimeout(() => {
+                if (!typing()) opts.onSingleTap(tapX, tapY);
+              }, DOUBLE_TAP_MS);
+            }
+          }
         }
         fire.leave();
       } else if (was.kind === "pan") {
+        if (was.pageSwipe && !cancelled) {
+          const dx = x - was.x0;
+          const [vx] = velocity(was.s, performance.now());
+          if (Math.abs(dx) > 54 || Math.abs(vx) > 0.45) {
+            if (opts.onSwipePage) opts.onSwipePage(dx < 0 ? 1 : -1);
+          }
+          fire.leave();
+          return;
+        }
         const [vx, vy] = cancelled || was.noFling ? [0, 0] : velocity(was.s, performance.now());
         const fx = was.lock === "y" ? 0 : vx, fy = was.lock === "x" ? 0 : vy;
         if (Math.hypot(fx, fy) > 0.25) startFling(fx, fy, was.x0, was.y0);
         else fire.leave();
+        if (was.fromPinch && opts.onPinchEnd) opts.onPinchEnd();
       } else {
         fire.move(x, y, 1);
         fire.up(x, y);
@@ -259,7 +285,6 @@
       }
     }
 
-    // Los eventos de puntero y de gestos de Safari que generan los dedos tampoco llegan a eframe.
     function block(e) {
       if (!e.isTrusted || e.target !== canvas) return;
       if (e.type.startsWith("pointer") && e.pointerType === "mouse") return;
@@ -275,7 +300,12 @@
     for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel", "gesturestart", "gesturechange", "gestureend"]) {
       window.addEventListener(type, block, active);
     }
-    return { stop: () => { stopFling(); fire.leave(); }, busy: () => !!(g || fling) };
+    return {
+      stop: () => { stopFling(); clearTimeout(singleTapTimer); fire.leave(); },
+      busy: () => !!(g || fling),
+      typing,
+      zoomBy,
+    };
   }
 
   window.pdfcraftGestures = { attach };

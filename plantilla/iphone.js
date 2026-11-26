@@ -1,15 +1,12 @@
-// PdfCraft para iPhone (app web instalada en la pantalla de inicio): pantalla de carga con
-// progreso, instalación sin conexión (service worker), actualización automática y archivos que
-// PdfCraft guarda (a movil.js o a la hoja de compartir de iOS). La interfaz de celular está en movil.js.
+// PdfCraft para iPhone: pantalla de carga, service worker sin conexión,
+// actualizaciones automáticas y hoja de compartir de iOS.
 (function () {
   "use strict";
 
-  // La interfaz de celular maneja PdfCraft con su API de página (window.pdfcraft), que PdfCraft
-  // instala solo si la dirección lleva ?control al arrancar.
   if (!/[?&]control(=|&|$)/.test(location.search)) {
     try {
       history.replaceState(history.state, "", location.pathname + (location.search ? location.search + "&control" : "?control") + location.hash);
-    } catch (e) { /* sin historial: queda la interfaz de escritorio */ }
+    } catch (e) {}
   }
 
   var splash = document.getElementById("pc-splash");
@@ -34,17 +31,18 @@
     setTimeout(function () { splash.hidden = true; }, 350);
   }
   function toast(text, ms) {
+    var existing = document.querySelectorAll(".pc-toast");
+    existing.forEach(function (n) { n.remove(); });
     var el = document.createElement("div");
     el.className = "pc-toast";
     el.setAttribute("role", "status");
     el.textContent = text;
     document.body.appendChild(el);
-    ms = ms || 4000;
+    ms = ms || 3400;
     setTimeout(function () { el.style.opacity = "0"; }, ms);
-    setTimeout(function () { el.remove(); }, ms + 600);
+    setTimeout(function () { el.remove(); }, ms + 400);
   }
   window.pdfcraftToast = toast;
-  // movil.js puede pedir que la pantalla de carga siga hasta tener lista su interfaz.
   window.pdfcraftHideSplash = hideSplash;
 
   window.addEventListener("error", function (e) {
@@ -61,7 +59,7 @@
     showError((r && (r.message || String(r))) || "Error desconocido al cargar.");
   });
 
-  // --- Service worker: instalación sin conexión y actualizaciones -------------------------
+  // --- Service worker ---
   var sw = ("serviceWorker" in navigator && window.isSecureContext) ? navigator.serviceWorker : null;
   var hadController = !!(sw && sw.controller);
   var registration = null;
@@ -77,27 +75,39 @@
       } else if (m.type === "install-failed") {
         installFailed = m.message || "error";
       } else if (m.type === "activated" && hadController) {
-        // Versión nueva ya guardada en el teléfono: movil.js recarga cuando no hay nada abierto.
         window.pdfcraftUpdateReady = true;
         if (window.pdfcraftOnUpdate) window.pdfcraftOnUpdate();
-        else toast("Se descargó una actualización de PdfCraft. Se usará la próxima vez que abras la app.", 7000);
+        else toast("Se descargó una actualización de PdfCraft. Se aplicará al volver a Inicio.", 6000);
       }
     });
     sw.register("./sw.js", { scope: "./" }).then(function (reg) { registration = reg; }).catch(function (e) {
       installFailed = String((e && e.message) || e);
     });
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
-    // Al volver a la app (iOS la deja en segundo plano), buscar versión nueva cada hora.
     document.addEventListener("visibilitychange", function () {
-      if (document.visibilityState === "visible" && registration && Date.now() - lastUpdateCheck > 3600 * 1000) {
+      if (document.visibilityState === "visible" && registration && Date.now() - lastUpdateCheck > 30 * 60 * 1000) {
         lastUpdateCheck = Date.now();
         registration.update().catch(function () {});
       }
     });
   }
 
-  // Primera vez: se espera a que la app quede guardada en el teléfono y se abre desde ahí
-  // (así el .wasm de ~70 MB se baja una sola vez).
+  window.pdfcraftCheckUpdate = async function () {
+    if (!registration) { toast("Actualizaciones disponibles al abrir desde la web instalada."); return; }
+    try {
+      await registration.update();
+      if (window.pdfcraftUpdateReady) {
+        if (window.pdfcraftOnUpdate) window.pdfcraftOnUpdate();
+      } else if (registration.installing || registration.waiting) {
+        toast("Descargando actualización en segundo plano…");
+      } else {
+        toast("PdfCraft ya está en su última versión");
+      }
+    } catch (e) {
+      toast("No se pudo comprobar actualizaciones (sin conexión)");
+    }
+  };
+
   function waitForInstall(timeoutMs) {
     return new Promise(function (resolve, reject) {
       if (!sw || sw.controller) return resolve();
@@ -118,7 +128,6 @@
     });
   }
 
-  // Lee el .wasm mostrando el progreso y lo entrega a wasm-bindgen como Response.
   window.pdfcraftFetchWasm = async function (url, expectedBytes) {
     if (sw && !sw.controller) {
       setStatus("Instalando PdfCraft en este iPhone…");
@@ -164,28 +173,28 @@
     if (!window.pdfcraftHoldSplash) setTimeout(hideSplash, 600);
   });
 
-  // Tamaño de interfaz para el celular la primera vez (se cambia en Preferencias).
   window.pdfcraftSeedSettings && window.pdfcraftSeedSettings();
 
-  // --- Archivos que PdfCraft guarda o exporta ----------------------------------------------
-  // PdfCraft los entrega como descarga de un blob. Primero se ofrecen a movil.js
-  // (window.pdfcraftOnFile, para guardarlos en la app); si no los toma, en iPhone/iPad se abre la
-  // hoja de compartir (Guardar en Archivos, AirDrop, Mail…) y en otros equipos se descargan.
+  // --- Archivos que PdfCraft guarda o exporta ---
   var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
   var blobs = new Map();
   var createURL = URL.createObjectURL.bind(URL);
   var revokeURL = URL.revokeObjectURL.bind(URL);
   var anchorClick = HTMLAnchorElement.prototype.click;
-  var types = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  var types = {
+    pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
     txt: "text/plain", html: "text/html", json: "application/json", svg: "image/svg+xml",
+    zip: "application/zip", csv: "text/csv",
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation", rtf: "application/rtf" };
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    rtf: "application/rtf",
+  };
   URL.createObjectURL = function (obj) {
     var url = createURL(obj);
     if (obj instanceof Blob) {
       blobs.set(url, obj);
-      if (blobs.size > 16) blobs.delete(blobs.keys().next().value);
+      if (blobs.size > 24) blobs.delete(blobs.keys().next().value);
     }
     return url;
   };
@@ -202,7 +211,6 @@
     a.remove();
     setTimeout(function () { revokeURL(a.href); }, 60000);
   }
-  // Comparte un archivo; si iOS no lo permite (p. ej. sin un toque reciente), devuelve false.
   window.pdfcraftShareFile = async function (file) {
     if (!(isIOS && navigator.share && navigator.canShare)) { download(file, file.name); return true; }
     var ok = false;
@@ -212,7 +220,7 @@
       await navigator.share({ files: [file] });
       return true;
     } catch (err) {
-      if (err && err.name === "AbortError") return true; // se cerró la hoja sin elegir
+      if (err && err.name === "AbortError") return true;
       if (err && err.name === "NotAllowedError") return false;
       download(file, file.name);
       return true;

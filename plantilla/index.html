@@ -4,13 +4,13 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <title>PdfCraft</title>
-    <meta name="description" content="PdfCraft: lector y editor de PDF, instalado en tu iPhone." />
+    <meta name="description" content="PdfCraft: lector, anotador y editor de PDF completo para iPhone." />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="PdfCraft" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="format-detection" content="telephone=no" />
-    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#f4f4f6" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
@@ -18,21 +18,19 @@
     <link rel="stylesheet" href="./movil.css" />
     <style>
       #pc-splash {
-        position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column;
+        position: fixed; inset: 0; z-index: 80; display: flex; flex-direction: column;
         align-items: center; justify-content: center; gap: 14px; padding: 24px;
         background: var(--bg); color: var(--fg); transition: opacity .3s ease;
       }
       #pc-splash.pc-out { opacity: 0; pointer-events: none; }
-      #pc-splash img { width: 96px; height: 96px; border-radius: 22px; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
-      #pc-splash h1 { margin: 6px 0 0; font-size: 22px; font-weight: 650; letter-spacing: -.01em; }
-      #pc-track { width: min(260px, 70vw); height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+      #pc-splash img { width: 92px; height: 92px; border-radius: 22px; box-shadow: 0 8px 28px rgba(0,0,0,.18); }
+      #pc-splash h1 { margin: 6px 0 0; font-size: 22px; font-weight: 700; letter-spacing: -.015em; }
+      #pc-track { width: min(260px, 70vw); height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
       #pc-bar { width: 2%; height: 100%; background: var(--accent); transition: width .15s linear; }
       #pc-status { color: var(--muted); font-size: 14px; min-height: 1.4em; text-align: center; }
       #pc-error { max-width: 320px; color: var(--fg); font-size: 13px; text-align: center; white-space: pre-wrap; }
     </style>
     <script>
-      // Primera vez: los paneles laterales de PdfCraft cerrados y sin buscar actualizaciones por
-      // su cuenta (la app se actualiza sola). El tamaño de la interfaz lo ajusta movil.js.
       window.pdfcraftSeedSettings = function () {
         try {
           if (localStorage.getItem("pdfcraft") !== null) return;
@@ -42,7 +40,7 @@
             update_check_at_start: false,
             side_panels: { rail_side: "right", side_width: 300, tools_open: false, tools_side: "left", tools_width: 260, version: 1 }
           }));
-        } catch (e) { /* sin almacenamiento: arranca con lo predeterminado */ }
+        } catch (e) {}
       };
     </script>
     __HEAD_LINKS__
@@ -56,46 +54,51 @@
       <div id="pc-error" hidden></div>
     </div>
 
-    <!-- Inicio: abrir, herramientas y archivos recientes -->
+    <!-- Shell principal (Inicio / Archivos / Herramientas) al estilo de Acrobat para iPhone -->
     <section id="pc-home" class="pc-screen" aria-label="Inicio">
-      <header class="pc-home-head">
-        <img src="./icons/icon-192.png" alt="" />
-        <h1>Inicio</h1>
-        <button class="pc-round" id="pc-settings" type="button" aria-label="Ajustes"></button>
-      </header>
-      <main class="pc-home-body">
-        <button class="pc-open" id="pc-open" type="button">
-          <span data-icon="open"></span>
-          <span><b>Abrir un PDF</b><small>Desde Archivos, iCloud Drive u otra app</small></span>
-        </button>
-        <div class="pc-section"><h2>Herramientas</h2></div>
-        <div class="pc-tools" id="pc-tools"></div>
-        <div class="pc-section"><h2>Recientes</h2></div>
-        <ul class="pc-recents" id="pc-recents" aria-label="Archivos recientes"></ul>
-        <div class="pc-empty" id="pc-empty" hidden>
-          <div data-icon="file"></div>
-          Aquí aparecerán los PDF que abras. Se guardan en esta app junto con tus cambios.
-        </div>
-      </main>
+      <header class="pc-app-head" id="pc-app-head"></header>
+      <main class="pc-tab-body" id="pc-tab-body"></main>
+      <button class="pc-create-fab" id="pc-create-fab" type="button" aria-label="Crear o abrir PDF"></button>
+      <nav class="pc-tabbar" id="pc-tabbar" aria-label="Navegación principal"></nav>
     </section>
 
-    <!-- Visor: el documento a pantalla completa con barras de celular -->
+    <!-- Visor de documento a pantalla completa -->
     <section id="pc-viewer" class="pc-screen" aria-label="Documento">
       <header class="pc-bar pc-top" id="pc-top"></header>
       <div id="pc-doc">
         <canvas id="pdfcraft" data-host="page"></canvas>
+        <div class="pc-dimmer" id="pc-dimmer" aria-hidden="true"></div>
+        <div class="pc-press-ring" id="pc-press-ring" hidden aria-hidden="true"></div>
         <div class="pc-shield" id="pc-shield" hidden></div>
         <div class="pc-busy" id="pc-busy" hidden><div class="pc-spinner"></div><span id="pc-busy-text">Abriendo…</span></div>
-        <button class="pc-float pc-pill" id="pc-pill" type="button" aria-label="Ir a una página">1 / 1</button>
-        <button class="pc-float pc-fab" id="pc-fab" type="button" aria-label="Herramientas"></button>
+
+        <!-- Barra flotante de navegación / scrubber de páginas -->
+        <div class="pc-scrubber" id="pc-scrubber" hidden>
+          <button class="pc-nav-hist" id="pc-hist-back" type="button" aria-label="Vista anterior" hidden></button>
+          <button class="pc-pill" id="pc-pill" type="button" aria-label="Ir a una página">1 / 1</button>
+          <div class="pc-range-wrap" id="pc-range-wrap">
+            <input type="range" id="pc-range" min="1" max="1" value="1" aria-label="Deslizar entre páginas" />
+          </div>
+          <button class="pc-nav-hist" id="pc-hist-fwd" type="button" aria-label="Vista siguiente" hidden></button>
+        </div>
+        <div class="pc-scrub-tip" id="pc-scrub-tip" hidden>Página 1</div>
       </div>
-      <footer class="pc-bar pc-toolbar" id="pc-toolbar" hidden></footer>
+
+      <!-- Barra inferior del visor: o bien la barra principal de Acrobat, o la barra de herramientas del modo activo -->
+      <footer class="pc-bar pc-bottom" id="pc-bottom">
+        <div class="pc-viewer-nav" id="pc-viewer-nav"></div>
+        <div class="pc-toolbar" id="pc-toolbar" hidden></div>
+      </footer>
     </section>
 
     <input type="file" id="pc-file" accept="application/pdf,.pdf" hidden />
+    <input type="file" id="pc-files-multi" accept="application/pdf,.pdf" multiple hidden />
+    <input type="file" id="pc-img-gallery" accept="image/*" multiple hidden />
+    <input type="file" id="pc-img-camera" accept="image/*" capture="environment" hidden />
 
     <script src="./iphone.js"></script>
     <script src="./gestos.js"></script>
+    <script src="./scanner.js"></script>
     <script src="./movil.js"></script>
     <script type="module">
       import init, * as bindings from "./__GLUE__";

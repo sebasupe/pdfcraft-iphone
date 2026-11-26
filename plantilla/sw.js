@@ -1,6 +1,6 @@
-// PdfCraft para iPhone: guarda la app completa en el teléfono para que abra sin conexión.
-// Generado por scripts/preparar.py. Cuando se publica una versión nueva, este archivo cambia,
-// el iPhone la baja en segundo plano y la usa la próxima vez que se abre la app.
+// PdfCraft para iPhone: guarda la app completa en el teléfono para uso sin conexión.
+// Cuando se publica una versión nueva en GitHub, este archivo cambia, se descarga solo lo nuevo
+// (sin volver a bajar el .wasm si no cambió) y se libera el caché viejo para ahorrar espacio.
 const VERSION = "__VERSION__";
 const PDFCRAFT = "__PDFCRAFT__";
 const CACHE = "pdfcraft-" + VERSION;
@@ -13,7 +13,6 @@ async function broadcast(message) {
   windows.forEach((client) => client.postMessage(message));
 }
 
-// El .wasm (~70 MB) se baja avisando el progreso a la página.
 async function fetchWasm() {
   const response = await fetch(new Request(WASM, { cache: "reload" }));
   if (!response.ok) throw new Error("No se pudo bajar la app (" + response.status + ")");
@@ -36,8 +35,6 @@ async function fetchWasm() {
   return new Response(new Blob(chunks, { type: "application/wasm" }), { headers: { "Content-Type": "application/wasm" } });
 }
 
-// Los archivos de PdfCraft llevan su huella en el nombre (pdfcraft-web-<hash>_bg.wasm…): si una
-// versión anterior ya los guardó, no cambiaron y no se vuelven a bajar.
 const HASHED = /-[0-9a-f]{16}(_bg|_loader)?\.(wasm|js)$/;
 async function reuse(cache, url) {
   if (!HASHED.test(url)) return false;
@@ -65,9 +62,10 @@ self.addEventListener("install", (event) => {
 
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
-    // Se guarda también la versión anterior, por si una pantalla abierta todavía la usa.
+    // El caché nuevo ya contiene todos los archivos (incluido el .wasm reutilizado):
+    // se eliminan cachés viejos para no duplicar ~70 MB en el almacenamiento del iPhone.
     const older = (await caches.keys()).filter((key) => key.startsWith("pdfcraft-") && key !== CACHE);
-    await Promise.all(older.slice(0, -1).map((key) => caches.delete(key)));
+    await Promise.all(older.map((key) => caches.delete(key)));
     await self.clients.claim();
     broadcast({ type: "activated", version: PDFCRAFT });
   })());
@@ -87,8 +85,6 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Primero lo guardado (versión actual, luego la anterior); lo que falte (p. ej. los modelos
-  // de reconocimiento de texto) se baja y se guarda.
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
     const hit = (await cache.match(request, { ignoreSearch: true })) ||
