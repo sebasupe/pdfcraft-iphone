@@ -98,10 +98,13 @@ svg.ic.ic-fill { fill: currentColor; stroke: currentColor; }
 /* ---------- Pantallas ---------- */
 .pc-screen { position: fixed; inset: 0; display: flex; flex-direction: column; }
 #pc-viewer { z-index: 1; background: var(--doc-bg); top: var(--pc-vtop, 0px); height: var(--pc-vh, 100%); bottom: auto; }
-#pc-home { z-index: 2; background: var(--bg); transition: transform .26s cubic-bezier(.32,.72,0,1), opacity .24s ease; }
+#pc-home { z-index: 2; background: var(--bg); top: var(--pc-vtop, 0px); height: var(--pc-vh, 100%); bottom: auto; transition: transform .26s cubic-bezier(.32,.72,0,1), opacity .24s ease; }
 body.pc-in-viewer #pc-home { transform: translateX(-24%); opacity: 0; pointer-events: none; }
 body:not(.pc-in-viewer) #pc-viewer { visibility: hidden; }
 body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
+body.pc-kb-open .pc-tabbar-wrap,
+body.pc-kb-open .pc-create-fab { opacity: 0; pointer-events: none; transform: translateY(20px); }
+body.pc-kb-open .pc-tab-body { padding-bottom: 24px; }
 
 /* ---------- Cabecera principal (estilo Acrobat iOS 2026) ---------- */
 .pc-app-head {
@@ -174,12 +177,12 @@ body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
   border-bottom: 1px solid var(--line);
 }
 .pc-utabs {
-  flex: 1; display: flex; align-items: center; gap: 20px;
+  flex: 1; display: flex; align-items: center; gap: clamp(12px, 3.6vw, 18px);
   overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch;
 }
 .pc-utabs::-webkit-scrollbar { display: none; }
 .pc-utab {
-  position: relative; flex: none; padding: 10px 2px 11px; font-size: 15px; font-weight: 550;
+  position: relative; flex: none; padding: 10px 2px 11px; font-size: clamp(13.5px, 3.8vw, 15px); font-weight: 550;
   color: var(--muted); white-space: nowrap;
 }
 .pc-utab[aria-selected="true"] { color: var(--fg); font-weight: 700; }
@@ -193,8 +196,12 @@ body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
 
 /* ---------- Cuerpo con desplazamiento de las pestañas ---------- */
 .pc-tab-body {
-  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
   padding: 6px calc(var(--right) + 16px) calc(var(--bottom) + 150px) calc(var(--left) + 16px);
+}
+.pc-iphone-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 2px 4px; font-size: 13px; color: var(--muted);
 }
 
 /* ¿Qué desea hacer? (Cuadrados oscuros tintados con ícono de línea, exacto a Acrobat iPhone) */
@@ -439,7 +446,7 @@ body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
 .pc-tabbar-wrap {
   position: fixed; left: 0; right: 0; bottom: calc(var(--bottom) + 8px); z-index: 6;
   padding: 0 calc(var(--right) + 12px) 0 calc(var(--left) + 12px);
-  pointer-events: none;
+  pointer-events: none; transition: opacity .18s ease, transform .18s ease;
 }
 .pc-tabbar {
   pointer-events: auto;
@@ -454,8 +461,12 @@ body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
 }
 .pc-tab-btn {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 2px; height: 50px; border-radius: 26px; color: var(--fg); opacity: .78;
-  font-size: 10px; font-weight: 600; transition: background .16s ease, color .16s ease;
+  gap: 2px; height: 50px; padding: 0 2px; border-radius: 26px; color: var(--fg); opacity: .78;
+  font-size: clamp(9px, 2.5vw, 10.5px); font-weight: 600; min-width: 0;
+  transition: background .16s ease, color .16s ease;
+}
+.pc-tab-btn > span:not(.pc-iw) {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .pc-tab-btn .ic { width: 20px; height: 20px; }
 .pc-tab-btn[aria-current="page"] {
@@ -543,11 +554,12 @@ body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
 }
 body.pc-fast-reader #pdfcraft { visibility: hidden; pointer-events: none; }
 .pc-reader-scroll {
-  position: absolute; inset: 0; overflow: auto;
+  position: absolute; inset: 0; overflow: auto; scrollbar-width: none;
   -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
   touch-action: pan-x pan-y;
   -webkit-user-select: auto; user-select: auto;
 }
+.pc-reader-scroll::-webkit-scrollbar { display: none; }
 .pc-reader-stage {
   display: flex; flex-direction: column; align-items: center;
   gap: var(--pc-gap, 10px); padding: 8px 0 48px; min-height: 100%;
@@ -612,9 +624,21 @@ body.pc-fast-reader #pdfcraft { visibility: hidden; pointer-events: none; }
 /* Modo Líquido (Lectura refluida y copia masiva sin bloqueos) */
 .pc-liquid {
   position: absolute; inset: 0; z-index: 3; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   background: var(--bg); color: var(--fg);
   padding: 10px calc(var(--right) + 20px) 72px calc(var(--left) + 20px);
   -webkit-user-select: text; user-select: text; -webkit-touch-callout: default;
+}
+.pc-liquid-pbtn {
+  font-variant-numeric: tabular-nums; background: var(--surface-2);
+}
+body.pc-read-noche .pc-liquid {
+  background: #111113; color: #e8e8ec;
+  --line: rgba(255, 255, 255, 0.1); --surface-2: rgba(255, 255, 255, 0.1); --muted: #a1a1aa;
+}
+body.pc-read-sepia .pc-liquid {
+  background: #f4ecd8; color: #362918;
+  --line: rgba(84, 60, 28, 0.16); --surface-2: rgba(84, 60, 28, 0.1); --muted: #70583c;
 }
 .pc-liquid-bar {
   position: sticky; top: 4px; z-index: 6; width: fit-content; margin: 0 auto 16px;
@@ -682,7 +706,7 @@ body.pc-read-sepia:not(.pc-modal):not(.pc-desktop):not(.pc-panel):not(.pc-pages-
 
 /* Botón temporal "Volver a pág. X" tras saltar con enlace o índice */
 .pc-back-jump {
-  position: absolute; z-index: 6; left: 12px; bottom: 14px;
+  position: absolute; z-index: 6; left: calc(var(--left) + 12px); bottom: 14px;
   height: 34px; padding: 0 13px; border-radius: 17px;
   display: inline-flex; align-items: center; gap: 6px;
   background: rgba(24, 24, 28, 0.9); color: #fff; font-size: 13px; font-weight: 600;
@@ -690,9 +714,20 @@ body.pc-read-sepia:not(.pc-modal):not(.pc-desktop):not(.pc-panel):not(.pc-pages-
 }
 .pc-back-jump .ic { width: 15px; height: 15px; }
 
+/* Indicador transitorio de zoom al pellizcar o hacer doble toque */
+.pc-zoom-pill {
+  position: absolute; z-index: 7; left: 50%; top: 14px; transform: translateX(-50%) scale(0.92);
+  padding: 5px 12px; border-radius: 14px;
+  background: rgba(18, 18, 22, 0.88); color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums;
+  pointer-events: none; opacity: 0; transition: opacity .16s ease, transform .16s ease;
+}
+.pc-zoom-pill.pc-show { opacity: 1; transform: translateX(-50%) scale(1); }
+
 /* Pestaña vertical del borde derecho para navegar páginas (exacto a Capturas 12, 14, 15, 19) */
 .pc-vthumb-track {
-  position: absolute; z-index: 6; top: 14px; bottom: 14px; right: 0; width: 46px;
+  position: absolute; z-index: 6; top: 14px; bottom: 14px; right: var(--right); width: 46px;
   pointer-events: none; transition: opacity .22s ease;
 }
 .pc-vthumb {
@@ -708,7 +743,7 @@ body.pc-read-sepia:not(.pc-modal):not(.pc-desktop):not(.pc-panel):not(.pc-pages-
 }
 .pc-vthumb.pc-dragging { background: var(--accent); color: var(--on-accent); transform: scale(1.08); }
 .pc-vthumb-tip {
-  position: absolute; z-index: 7; right: 54px; top: 50%; transform: translateY(-50%);
+  position: absolute; z-index: 7; right: calc(var(--right) + 54px); top: 50%; transform: translateY(-50%);
   padding: 7px 14px; border-radius: 12px; background: rgba(18, 18, 22, 0.94); color: #fff;
   font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; pointer-events: none;
   border: 1px solid rgba(255, 255, 255, 0.14); box-shadow: var(--shadow);
@@ -801,6 +836,7 @@ body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
   box-shadow: var(--shadow); max-width: calc(100% - 12px); overflow-x: auto; scrollbar-width: none;
   animation: pc-fade .14s ease;
 }
+.pc-selbar.pc-selbar-bottom { top: auto; bottom: 14px; }
 .pc-selbar::-webkit-scrollbar { display: none; }
 .pc-selbar button {
   color: #fff; padding: 8px 6.5px; font-size: 11.5px; font-weight: 600; white-space: nowrap;
@@ -813,14 +849,17 @@ body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
 
 /* ---------- Vista nativa Páginas / Organizar páginas (exacto a Captura 17) ---------- */
 .pc-pages-overlay {
-  position: fixed; inset: 0; z-index: 35; background: var(--bg);
+  position: fixed; left: 0; right: 0; top: var(--pc-vtop, 0px); height: var(--pc-vh, 100%);
+  z-index: 35; background: var(--bg);
   display: flex; flex-direction: column; animation: pc-fade .18s ease;
 }
 .pc-pg-head {
-  flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: calc(var(--top) + 8px) calc(var(--right) + 12px) 10px calc(var(--left) + 12px);
+  flex: none; display: flex; align-items: center; justify-content: space-between; gap: 4px;
+  padding: calc(var(--top) + 8px) calc(var(--right) + 8px) 10px calc(var(--left) + 8px);
   background: var(--bg); border-bottom: 1px solid var(--line); min-height: calc(var(--top) + 56px);
 }
+.pc-pg-head .pc-icon-btn { width: 34px; height: 36px; }
+.pc-pg-head .pc-text-btn { padding: 0 7px; font-size: 14.5px; }
 .pc-pg-head-spacer { width: 40px; flex: none; }
 .pc-pg-title { margin: 0; font-size: 18px; font-weight: 700; text-align: center; flex: 1; }
 .pc-pg-title-stack { flex: 1; min-width: 0; text-align: center; }
@@ -833,7 +872,7 @@ body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
   background: var(--surface-2); border: 1px solid var(--line); color: var(--fg); flex: none;
 }
 .pc-pg-body {
-  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
   padding: 18px calc(var(--right) + 16px) 28px calc(var(--left) + 16px);
 }
 .pc-pg-grid { display: grid; gap: 18px 14px; }
@@ -908,13 +947,18 @@ body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
 .pc-pg-obtn:active { background: var(--surface-2); }
 
 /* ---------- Hojas modales desde abajo (iOS Bottom Sheets) ---------- */
-.pc-sheet-wrap { position: fixed; inset: 0; z-index: 45; display: flex; flex-direction: column; justify-content: flex-end; }
+.pc-sheet-wrap {
+  position: fixed; left: 0; right: 0; top: var(--pc-vtop, 0px); height: var(--pc-vh, 100%);
+  z-index: 45; display: flex; flex-direction: column; justify-content: flex-end;
+}
 .pc-scrim { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.52); animation: pc-fade .18s ease; }
 .pc-sheet {
-  position: relative; background: var(--surface); border-radius: 22px 22px 0 0; max-height: 88vh; overflow-y: auto;
+  position: relative; background: var(--surface); border-radius: 22px 22px 0 0; max-height: 88%; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
   padding: 8px calc(var(--right) + 16px) calc(var(--bottom) + 20px) calc(var(--left) + 16px);
   animation: pc-up .24s cubic-bezier(.32,.72,0,1);
 }
+body.pc-kb-open .pc-sheet { padding-bottom: 16px; max-height: 96%; }
 .pc-grabber { width: 40px; height: 4px; border-radius: 2px; background: var(--muted); opacity: .45; margin: 2px auto 12px; }
 .pc-sheet-head {
   display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
@@ -1050,7 +1094,7 @@ body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
 .pc-toast {
   position: fixed; z-index: 80; left: 50%; transform: translateX(-50%); bottom: calc(var(--bottom) + 92px);
   max-width: min(350px, 90vw); padding: 10px 16px; border-radius: 14px; background: rgba(24, 24, 28, 0.96); color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.14); pointer-events: none;
   font-size: 14px; font-weight: 550; line-height: 1.35; text-align: center; box-shadow: var(--shadow); transition: opacity .3s ease;
 }
 

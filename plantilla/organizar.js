@@ -206,15 +206,26 @@
     if (!activeSession) return;
     const s = activeSession;
     activeSession = null;
+    if (s.cancelDrag) { try { s.cancelDrag(); } catch (e) {} }
     if (s.io) s.io.disconnect();
     if (s.ownPdfDoc) { s.ownPdfDoc.destroy().catch(() => {}); }
     if (s.ownCleanup) { try { s.ownCleanup(); } catch (e) {} }
+    if (s.extPdfDocs) {
+      for (const p of s.extPdfDocs.values()) {
+        p.then((opened) => {
+          if (opened && opened.doc) opened.doc.destroy().catch(() => {});
+          if (opened && opened.cleanup) { try { opened.cleanup(); } catch (e) {} }
+        }).catch(() => {});
+      }
+      s.extPdfDocs.clear();
+    }
     if (s.ownObjUrl) {
       try { (window.__pcRawRevokeObjectURL || URL.revokeObjectURL)(s.ownObjUrl); } catch (e) {}
     }
     s.overlay.hidden = true;
     s.overlay.replaceChildren();
     document.body.classList.remove("pc-pages-open");
+    if (s.onClose) { try { s.onClose(); } catch (e) {} }
   }
 
   async function open(options) {
@@ -228,10 +239,12 @@
       pageCount,
       currentPage,
       mode, // "view" | "organize"
+      openSplit,
       reader,
       toast,
       sheet,
       list,
+      onClose,
       onJumpPage,
       onEditPdf,
       onCropPages,
@@ -247,6 +260,7 @@
 
     const S = {
       overlay,
+      onClose,
       mode: mode === "organize" ? "organize" : "view",
       cols: 2,
       dirty: false,
@@ -260,15 +274,73 @@
       activeThumbs: 0,
       io: null,
       ownPdfDoc: null,
+      ownPdfDocPromise: null,
+      ownCleanup: null,
+      extPdfDocs: new Map(), // extId -> Promise<{doc, cleanup}>
       ownObjUrl: null,
       saving: false,
       drag: null,
+      cancelDrag: null,
     };
 
     for (let i = 0; i < (pageCount || 1); i++) {
       S.pages.push({ id: makeId(), source: "orig", srcIndex: i, rot: 0, origNum: i + 1 });
     }
     activeSession = S;
+
+    async function getOwnPdfDoc() {
+      if (S.ownPdfDoc) return S.ownPdfDoc;
+      if (!S.ownPdfDocPromise && blob && window.pdfcraftReader && window.pdfcraftReader.openDocumentFromBlob) {
+        S.ownPdfDocPromise = window.pdfcraftReader.openDocumentFromBlob(blob).then((opened) => {
+          if (activeSession !== S) {
+            if (opened && opened.doc) opened.doc.destroy().catch(() => {});
+            if (opened && opened.cleanup) { try { opened.cleanup(); } catch (e) {} }
+            return null;
+          }
+          S.ownPdfDoc = opened.doc;
+          S.ownCleanup = opened.cleanup;
+          return opened.doc;
+        }).catch(() => { S.ownPdfDocPromise = null; return null; });
+      }
+      return S.ownPdfDocPromise;
+    }
+
+    async function getExtPdfDoc(extId, extBlob) {
+      if (!extBlob || !window.pdfcraftReader || !window.pdfcraftReader.openDocumentFromBlob) return null;
+      if (!S.extPdfDocs.has(extId)) {
+        const p = window.pdfcraftReader.openDocumentFromBlob(extBlob).then((opened) => {
+          if (activeSession !== S) {
+            if (opened && opened.doc) opened.doc.destroy().catch(() => {});
+            if (opened && opened.cleanup) { try { opened.cleanup(); } catch (e) {} }
+            return null;
+          }
+          return opened;
+        }).catch(() => null);
+        S.extPdfDocs.set(extId, p);
+      }
+      const res = await S.extPdfDocs.get(extId);
+      return res ? res.doc : null;
+    }
+
+    async function renderPageThumb(doc, pageNum) {
+      if (!doc || activeSession !== S) return null;
+      const pg = await doc.getPage(pageNum);
+      if (activeSession !== S) return null;
+      const vp1 = pg.getViewport({ scale: 1 });
+      const scale = Math.max(0.12, Math.min(1, 240 / Math.max(1, vp1.width)));
+      const vp = pg.getViewport({ scale });
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(vp.width));
+      c.height = Math.max(1, Math.round(vp.height));
+      const ctx = c.getContext("2d", { alpha: false });
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, c.width, c.height);
+      await pg.render({ canvasContext: ctx, viewport: vp, intent: "display" }).promise;
+      const url = c.toDataURL("image/jpeg", 0.75);
+      c.width = 0; c.height = 0;
+      try { pg.cleanup(); } catch (e) {}
+      return url;
+    }
 
     // Si el lector rápido no está abierto, cargamos una instancia ligera de PDF.js solo para miniaturas
     async function renderThumbFor(item) {
@@ -283,29 +355,13 @@
         if (reader && reader.isOpen && reader.isOpen() && reader.renderThumbnail) {
           url = await reader.renderThumbnail(item.srcIndex + 1, 240, 0).catch(() => null);
         }
-        if (!url && blob && window.pdfcraftReader && window.pdfcraftReader.openDocumentFromBlob) {
-          if (!S.ownPdfDoc) {
-            const opened = await window.pdfcraftReader.openDocumentFromBlob(blob);
-            S.ownPdfDoc = opened.doc;
-            S.ownCleanup = opened.cleanup;
-          }
-          if (S.ownPdfDoc && activeSession === S) {
-            const pg = await S.ownPdfDoc.getPage(item.srcIndex + 1);
-            const vp1 = pg.getViewport({ scale: 1 });
-            const scale = Math.max(0.12, Math.min(1, 240 / Math.max(1, vp1.width)));
-            const vp = pg.getViewport({ scale });
-            const c = document.createElement("canvas");
-            c.width = Math.max(1, Math.round(vp.width));
-            c.height = Math.max(1, Math.round(vp.height));
-            const ctx = c.getContext("2d", { alpha: false });
-            ctx.fillStyle = "#ffffff";
-            ctx.fillRect(0, 0, c.width, c.height);
-            await pg.render({ canvasContext: ctx, viewport: vp, intent: "display" }).promise;
-            url = c.toDataURL("image/jpeg", 0.75);
-            c.width = 0; c.height = 0;
-            try { pg.cleanup(); } catch (e) {}
-          }
+        if (!url) {
+          const doc = await getOwnPdfDoc();
+          url = await renderPageThumb(doc, item.srcIndex + 1).catch(() => null);
         }
+      } else if (item.source === "pdf" && item.extBlob) {
+        const extDoc = await getExtPdfDoc(item.extId, item.extBlob);
+        url = await renderPageThumb(extDoc, item.srcIndex + 1).catch(() => null);
       }
       if (url) {
         S.thumbCache.set(cacheKey, url);
@@ -497,9 +553,13 @@
               i: "image", t: "Desde fotos / galería", small: "JPG o PNG",
               run: () => {
                 c();
-                const inp = el("input", { type: "file", accept: "image/*", multiple: true });
+                const inp = el("input", { type: "file", accept: "image/*", multiple: true, hidden: true });
+                document.body.append(inp);
+                const cleanup = () => { inp.remove(); };
+                inp.addEventListener("cancel", cleanup);
                 inp.addEventListener("change", async () => {
                   const chosen = Array.from(inp.files || []);
+                  cleanup();
                   if (!chosen.length) return;
                   const added = [];
                   for (const imgFile of chosen) {
@@ -514,15 +574,21 @@
                       ctx.fillStyle = "#ffffff";
                       ctx.fillRect(0, 0, c2.width, c2.height);
                       ctx.drawImage(img, 0, 0, c2.width, c2.height);
-                      const jpgUrl = c2.toDataURL("image/jpeg", 0.86);
-                      const bin = atob(jpgUrl.split(",")[1] || "");
-                      const bytes = new Uint8Array(bin.length);
-                      for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+                      let bytes;
+                      if (window.pdfcraftScanner && window.pdfcraftScanner.canvasToJpegBytes) {
+                        bytes = await window.pdfcraftScanner.canvasToJpegBytes(c2, 0.86);
+                      } else {
+                        const jpgUrl = c2.toDataURL("image/jpeg", 0.86);
+                        const bin = atob(jpgUrl.split(",")[1] || "");
+                        bytes = new Uint8Array(bin.length);
+                        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+                      }
                       c2.width = 0; c2.height = 0;
+                      img.src = "";
                       added.push({ id: makeId(), source: "image", imgBytes: bytes, isPng: false, thumbUrl, rot: 0 });
                     } catch (e) { tell("No se pudo leer una imagen"); }
                   }
-                  if (added.length) {
+                  if (added.length && activeSession === S) {
                     pushUndo();
                     S.pages.splice(insertAt, 0, ...added);
                     render();
@@ -536,9 +602,13 @@
               i: "open", t: "Desde otro archivo PDF…", small: "Archivos / iCloud",
               run: () => {
                 c();
-                const inp = el("input", { type: "file", accept: "application/pdf,.pdf" });
+                const inp = el("input", { type: "file", accept: "application/pdf,.pdf", hidden: true });
+                document.body.append(inp);
+                const cleanup = () => { inp.remove(); };
+                inp.addEventListener("cancel", cleanup);
                 inp.addEventListener("change", async () => {
                   const extFile = inp.files && inp.files[0];
+                  cleanup();
                   if (!extFile) return;
                   try {
                     const extDoc = await loadPdfLibDoc(extFile);
@@ -556,10 +626,12 @@
                         rot: 0,
                       });
                     }
-                    pushUndo();
-                    S.pages.splice(insertAt, 0, ...added);
-                    render();
-                    tell(count + (count === 1 ? " página añadida" : " páginas añadidas") + " de " + extFile.name);
+                    if (activeSession === S) {
+                      pushUndo();
+                      S.pages.splice(insertAt, 0, ...added);
+                      render();
+                      tell(count + (count === 1 ? " página añadida" : " páginas añadidas") + " de " + extFile.name);
+                    }
                   } catch (e) {
                     tell(e.message || "No se pudo leer el PDF");
                   }
@@ -615,10 +687,13 @@
               c();
               const picked = nums.map((n) => S.pages[n - 1]).filter(Boolean);
               const base = (name || "Documento").replace(/\.pdf$/i, "");
+              S.saving = true; renderHeader();
               try {
                 const file = await buildPdfFromDescriptors(blob, picked, `${base} (pág ${rangeInput.value.trim()}).pdf`);
+                S.saving = false; renderHeader();
                 if (onExtractedPdf) await onExtractedPdf(file, picked.length);
               } catch (e) {
+                S.saving = false; renderHeader();
                 tell("No se pudo dividir: " + (e.message || e));
               }
             },
@@ -630,11 +705,14 @@
             onclick: async () => {
               const n = Math.max(1, parseInt(everyInput.value, 10) || 1);
               c();
+              S.saving = true; renderHeader();
               try {
                 const srcBlob = S.dirty ? await buildPdfFromDescriptors(blob, S.pages, name) : blob;
                 const parts = await splitPdfByChunks(srcBlob, n, name);
+                S.saving = false; renderHeader();
                 if (onSplitPdfs) await onSplitPdfs(parts);
               } catch (e) {
+                S.saving = false; renderHeader();
                 tell("No se pudo dividir: " + (e.message || e));
               }
             },
@@ -688,12 +766,16 @@
       }
     }
 
-    // ---------- Arrastre táctil (drag-and-drop) para reordenar tarjetas ----------
+    // ---------- Arrastre táctil (drag-and-drop) con auto-scroll en bordes ----------
     function startCardDrag(ev, fromIdx, cardEl) {
       ev.preventDefault();
       ev.stopPropagation();
-      const touch = ev.touches ? ev.touches[0] : ev;
+      const isTouch = !!ev.touches;
+      const touch = isTouch ? ev.touches[0] : ev;
+      const touchId = isTouch ? touch.identifier : null;
       let targetIdx = fromIdx;
+      let lastPt = { x: touch.clientX, y: touch.clientY };
+      let autoScrollRaf = 0;
       cardEl.classList.add("pc-pg-dragging");
 
       const ghost = cardEl.cloneNode(true);
@@ -706,14 +788,9 @@
       const offX = touch.clientX - r.left;
       const offY = touch.clientY - r.top;
 
-      const onMove = (me) => {
-        const pt = me.touches ? me.touches[0] : me;
-        if (!pt) return;
-        if (me.cancelable) me.preventDefault();
-        ghost.style.left = (pt.clientX - offX) + "px";
-        ghost.style.top = (pt.clientY - offY) + "px";
+      const updateDropTarget = (cx, cy) => {
         ghost.style.visibility = "hidden";
-        const under = document.elementFromPoint(pt.clientX, pt.clientY);
+        const under = document.elementFromPoint(cx, cy);
         ghost.style.visibility = "";
         const hit = under && under.closest ? under.closest(".pc-pg-card[data-idx]") : null;
         overlay.querySelectorAll(".pc-pg-drop-target").forEach((n) => n.classList.remove("pc-pg-drop-target"));
@@ -726,16 +803,47 @@
         }
       };
 
-      const onEnd = () => {
+      const stepAutoScroll = () => {
+        autoScrollRaf = 0;
+        if (!S.cancelDrag) return;
+        const br = bodyEl.getBoundingClientRect();
+        const edge = 68;
+        let dy = 0;
+        if (lastPt.y < br.top + edge) dy = -Math.ceil(((br.top + edge - lastPt.y) / edge) * 14);
+        else if (lastPt.y > br.bottom - edge) dy = Math.ceil(((lastPt.y - (br.bottom - edge)) / edge) * 14);
+        if (dy !== 0) {
+          bodyEl.scrollTop += dy;
+          updateDropTarget(lastPt.x, lastPt.y);
+          autoScrollRaf = requestAnimationFrame(stepAutoScroll);
+        }
+      };
+
+      const onMove = (me) => {
+        const pt = me.touches
+          ? Array.prototype.find.call(me.touches, (t) => t.identifier === touchId) || me.touches[0]
+          : me;
+        if (!pt) return;
+        if (me.cancelable) me.preventDefault();
+        lastPt = { x: pt.clientX, y: pt.clientY };
+        ghost.style.left = (pt.clientX - offX) + "px";
+        ghost.style.top = (pt.clientY - offY) + "px";
+        updateDropTarget(pt.clientX, pt.clientY);
+        if (!autoScrollRaf) autoScrollRaf = requestAnimationFrame(stepAutoScroll);
+      };
+
+      const finish = (cancelled) => {
+        S.cancelDrag = null;
+        if (autoScrollRaf) { cancelAnimationFrame(autoScrollRaf); autoScrollRaf = 0; }
         window.removeEventListener("touchmove", onMove, { passive: false });
         window.removeEventListener("touchend", onEnd);
-        window.removeEventListener("touchcancel", onEnd);
+        window.removeEventListener("touchcancel", onCancel);
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onEnd);
+        window.removeEventListener("pointercancel", onCancel);
         ghost.remove();
         cardEl.classList.remove("pc-pg-dragging");
         overlay.querySelectorAll(".pc-pg-drop-target").forEach((n) => n.classList.remove("pc-pg-drop-target"));
-        if (targetIdx !== fromIdx && targetIdx >= 0 && targetIdx < S.pages.length) {
+        if (!cancelled && targetIdx !== fromIdx && targetIdx >= 0 && targetIdx < S.pages.length) {
           pushUndo();
           const [moved] = S.pages.splice(fromIdx, 1);
           S.pages.splice(targetIdx, 0, moved);
@@ -743,12 +851,19 @@
           tell("Página movida a posición " + (targetIdx + 1));
         }
       };
+      const onEnd = () => finish(false);
+      const onCancel = () => finish(true);
+      S.cancelDrag = () => finish(true);
 
-      window.addEventListener("touchmove", onMove, { passive: false });
-      window.addEventListener("touchend", onEnd);
-      window.addEventListener("touchcancel", onEnd);
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onEnd);
+      if (isTouch) {
+        window.addEventListener("touchmove", onMove, { passive: false });
+        window.addEventListener("touchend", onEnd);
+        window.addEventListener("touchcancel", onCancel);
+      } else {
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onEnd);
+        window.addEventListener("pointercancel", onCancel);
+      }
     }
 
     // ---------- Renderizado de la pantalla Páginas / Organizar ----------
@@ -772,20 +887,34 @@
         return;
       }
 
+      const cancelOrClose = () => {
+        if (!S.dirty) { close(); return; }
+        sheet({
+          title: "¿Descartar cambios?",
+          text: "Los cambios en el orden o rotación de páginas no se guardarán.",
+          build: (c) => [
+            el("button", { class: "pc-primary", type: "button", text: "Guardar y aplicar", onclick: () => { c(); commitAndClose(); } }),
+            el("button", { class: "pc-secondary", style: "color:var(--danger)", type: "button", text: "Descartar cambios", onclick: () => { c(); close(); } }),
+          ],
+        });
+      };
+
       const selCount = S.selected.size;
       const allSelected = selCount > 0 && selCount === S.pages.length;
       headEl.replaceChildren(
-        el("button", {
-          class: "pc-text-btn", type: "button", disabled: S.saving,
-          text: S.saving ? "Guardando…" : "Hecho",
-          onclick: commitAndClose,
-        }),
+        el("div", { class: "pc-pg-head-acts" },
+          el("button", { class: "pc-icon-btn", type: "button", "aria-label": "Cancelar", icon: "close", disabled: S.saving, onclick: cancelOrClose }),
+          el("button", {
+            class: "pc-text-btn" + (S.dirty ? " pc-accent" : ""), type: "button", disabled: S.saving,
+            text: S.saving ? "Guardando…" : (S.dirty ? "Guardar" : "Hecho"),
+            onclick: commitAndClose,
+          })),
         el("div", { class: "pc-pg-title-stack" },
-          el("b", { text: "Organizar páginas" }),
+          el("b", { text: "Organizar" }),
           el("small", {
             text: selCount
-              ? (selCount + (selCount === 1 ? " seleccionada" : " seleccionadas"))
-              : (S.pages.length + (S.pages.length === 1 ? " página" : " páginas") + (S.dirty ? " · editado" : "")),
+              ? (selCount + (selCount === 1 ? " selecc." : " selecc."))
+              : (S.pages.length + (S.pages.length === 1 ? " pág." : " págs.") + (S.dirty ? " · editado" : "")),
           })),
         el("div", { class: "pc-pg-head-acts" },
           el("button", { class: "pc-icon-btn", type: "button", "aria-label": "Deshacer", icon: "undo", disabled: !S.undoStack.length, onclick: undo }),
@@ -809,6 +938,7 @@
     }
 
     function renderGrid() {
+      const prevScroll = bodyEl.scrollTop;
       if (S.io) S.io.disconnect();
       S.thumbQueue = [];
       const grid = el("div", { class: "pc-pg-grid pc-pg-cols-" + S.cols });
@@ -840,8 +970,6 @@
         const frame = el("div", { class: "pc-pg-frame" });
         if (item.source === "blank") {
           frame.append(el("div", { class: "pc-pg-placeholder" }, el("span", { icon: "blank" }), el("small", { text: "En blanco" })));
-        } else if (item.source === "pdf" && !item.thumbUrl) {
-          frame.append(el("div", { class: "pc-pg-placeholder" }, el("span", { icon: "open" }), el("small", { text: "Pág. " + (item.srcIndex + 1) })));
         } else {
           const img = el("img", { class: "pc-pg-img", alt: "Página " + (idx + 1) });
           if (item.rot) img.style.transform = `rotate(${item.rot}deg)` + (item.rot % 180 === 90 ? " scale(0.76)" : "");
@@ -870,7 +998,8 @@
           frame.append(el("span", { class: "pc-pg-rot-tag", text: item.rot + "°" }));
         }
 
-        card.addEventListener("click", () => {
+        card.addEventListener("click", (ev) => {
+          if (ev.target && ev.target.closest && ev.target.closest(".pc-pg-grip")) return;
           if (S.mode === "view") {
             close();
             if (onJumpPage) onJumpPage(idx + 1);
@@ -889,10 +1018,11 @@
 
         card.append(frame, el("div", { class: "pc-pg-num", text: String(idx + 1) }));
         grid.append(card);
-        if (item.source === "orig") S.io.observe(card);
+        if (item.source === "orig" || item.source === "pdf") S.io.observe(card);
       });
 
       bodyEl.replaceChildren(grid);
+      bodyEl.scrollTop = prevScroll;
     }
 
     function renderFooter() {
@@ -946,6 +1076,7 @@
     setTimeout(() => {
       const curCard = bodyEl.querySelector(`.pc-pg-card[data-idx="${S.currentPage - 1}"]`);
       if (curCard) curCard.scrollIntoView({ block: "center", behavior: "auto" });
+      if (openSplit && activeSession === S) openSplitSheet();
     }, 30);
   }
 

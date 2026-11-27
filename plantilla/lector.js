@@ -46,10 +46,18 @@
         if (this._aborted || !this._blob) return;
         const safeBegin = Math.max(0, Math.min(this._blob.size, begin));
         const safeEnd = Math.max(safeBegin, Math.min(this._blob.size, end));
-        this._blob.slice(safeBegin, safeEnd).arrayBuffer().then((buf) => {
-          if (this._aborted) return;
-          this.onDataRange(begin, new Uint8Array(buf));
-        }).catch(() => {});
+        const readOnce = (attempt) => {
+          if (this._aborted || !this._blob) return;
+          this._blob.slice(safeBegin, safeEnd).arrayBuffer().then((buf) => {
+            if (this._aborted) return;
+            this.onDataRange(begin, new Uint8Array(buf));
+          }).catch(() => {
+            if (this._aborted) return;
+            if (attempt < 1) setTimeout(() => readOnce(attempt + 1), 80);
+            else this.abort();
+          });
+        };
+        readOnce(0);
       }
       abort() {
         this._aborted = true;
@@ -66,6 +74,8 @@
     let pdfjs = null;
     let pdfDoc = null;
     let rangeTransport = null;
+    let activeLoadingTask = null;
+    let openEpoch = 0;
     let opts = {};
     let destroyed = false;
 
@@ -80,7 +90,8 @@
       minScale: 0.3,
       maxScale: 5.5,
       refWidth: 612,
-      pageDims: [],    // [{ w, h }] en puntos PDF (rotación 0)
+      refDim: { w: 612, h: 792 },
+      pageDims: [],    // [{ w, h }] en puntos PDF (con rotación intrínseca de la página)
       slots: [],
       textCache: new Map(), // LRU: pageNum -> { rawContent, items, styles, vp1 }
       searchQuery: "",
@@ -95,6 +106,10 @@
       lastSelectedText: "",
       stagePadTop: 8,
     };
+
+    function pageTotalRotation(page) {
+      return (((page && page.rotate) || 0) + S.rotation + 360) % 360;
+    }
 
     let renderTimer = null;
     let hdTimer = null;
@@ -514,6 +529,52 @@
     }
 
     // ---------- Renderizado base en Worker ----------
+    function pumpPendingBase() {
+      if (destroyed || !pdfDoc || S.pinching || S.animatingZoom || activeBaseRenders >= 2) return;
+      const { visible } = findVisibleSlots();
+      visible.sort((a, b) => Math.abs(a.num - S.page) - Math.abs(b.num - S.page));
+      for (const s of visible) {
+        if (activeBaseRenders >= 2) break;
+        const dpr = effectiveDpr();
+        const dispScale = slotDisplayScale(s.num);
+        const sz = pageRotatedSize(s.num);
+        const targetScale = Math.min(dispScale * dpr, MAX_BASE_DIM / Math.max(sz.w, sz.h));
+        const needsBase = !s.baseCanvas || Math.abs(s.baseScale - targetScale) / Math.max(0.01, targetScale) >= 0.08;
+        if (needsBase && !s.task) ensureBaseRendered(s);
+      }
+    }
+
+    function pumpPendingText() {
+      if (destroyed || !pdfDoc || S.pinching || S.animatingZoom || activeTextBuilds >= 2) return;
+      const { visible } = findVisibleSlots();
+      const targets = visible.slice();
+      if (S.layout !== "single") {
+        const prevSlot = getSlot(S.page - 1);
+        const nextSlot = getSlot(S.page + 1);
+        if (prevSlot && !targets.includes(prevSlot)) targets.push(prevSlot);
+        if (nextSlot && !targets.includes(nextSlot)) targets.push(nextSlot);
+      }
+      targets.sort((a, b) => Math.abs(a.num - S.page) - Math.abs(b.num - S.page));
+      for (const s of targets) {
+        if (activeTextBuilds >= 2) break;
+        if (!s.textBuilt && !s.textBuilding) ensureTextLayer(s);
+      }
+    }
+
+    function pumpPendingHd() {
+      if (destroyed || !pdfDoc || S.pinching || S.animatingZoom || activeHdRenders >= 1) return;
+      const { visible } = findVisibleSlots();
+      visible.sort((a, b) => Math.abs(a.num - S.page) - Math.abs(b.num - S.page));
+      for (const s of visible) {
+        if (activeHdRenders >= 1) break;
+        const dpr = effectiveDpr();
+        const desiredScale = slotDisplayScale(s.num) * dpr;
+        if (s.baseCanvas && s.baseScale >= desiredScale * 0.92) continue;
+        ensureHdTile(s);
+        if (activeHdRenders >= 1) break;
+      }
+    }
+
     async function ensureBaseRendered(slot) {
       if (destroyed || !pdfDoc) return;
       const dpr = effectiveDpr();
@@ -528,10 +589,7 @@
         try { slot.task.cancel(); } catch (e) {}
         slot.task = null;
       }
-      if (activeBaseRenders >= 2) {
-        setTimeout(() => ensureBaseRendered(slot), 50);
-        return;
-      }
+      if (activeBaseRenders >= 2) return;
 
       slot.pendingBaseScale = targetScale;
       activeBaseRenders++;
@@ -539,13 +597,13 @@
         const page = await pdfDoc.getPage(slot.num);
         if (destroyed || !pdfDoc) return;
         slot.pageProxy = page;
-        const vp1 = page.getViewport({ scale: 1, rotation: 0 });
+        const vp1 = page.getViewport({ scale: 1 });
         updateSingleSlotDim(slot, vp1.width, vp1.height);
 
         const dispScaleNow = slotDisplayScale(slot.num);
         const szNow = pageRotatedSize(slot.num);
         const renderScale = Math.min(dispScaleNow * dpr, MAX_BASE_DIM / Math.max(szNow.w, szNow.h));
-        const viewport = page.getViewport({ scale: renderScale, rotation: S.rotation });
+        const viewport = page.getViewport({ scale: renderScale, rotation: pageTotalRotation(page) });
         const cw = Math.max(1, Math.floor(viewport.width));
         const ch = Math.max(1, Math.floor(viewport.height));
 
@@ -587,6 +645,7 @@
       } catch (e) {
       } finally {
         activeBaseRenders = Math.max(0, activeBaseRenders - 1);
+        pumpPendingBase();
       }
     }
 
@@ -622,7 +681,7 @@
       try {
         const page = await pdfDoc.getPage(slot.num);
         if (destroyed || !pdfDoc || S.pinching) return;
-        const viewport = page.getViewport({ scale: dispScale, rotation: S.rotation });
+        const viewport = page.getViewport({ scale: dispScale, rotation: pageTotalRotation(page) });
         const off = document.createElement("canvas");
         off.className = "pc-page-hd";
         off.width = Math.max(1, Math.round(tw * tileDpr));
@@ -656,6 +715,7 @@
       } catch (e) {
       } finally {
         activeHdRenders = Math.max(0, activeHdRenders - 1);
+        pumpPendingHd();
       }
     }
 
@@ -669,17 +729,13 @@
           slot.textScale = dispScale;
           pdfDoc.getPage(slot.num).then((page) => {
             if (destroyed || !slot.textLayer) return;
-            const vp = page.getViewport({ scale: dispScale, rotation: S.rotation });
+            const vp = page.getViewport({ scale: dispScale, rotation: pageTotalRotation(page) });
             try { slot.textLayer.update({ viewport: vp }); } catch (e) {}
           }).catch(() => {});
         }
         return;
       }
-      if (slot.textBuilding) return;
-      if (activeTextBuilds >= 2) {
-        setTimeout(() => { if (!destroyed && pdfDoc && !slot.textBuilt) ensureTextLayer(slot); }, 70);
-        return;
-      }
+      if (slot.textBuilding || activeTextBuilds >= 2) return;
 
       slot.textBuilding = true;
       activeTextBuilds++;
@@ -687,14 +743,14 @@
       try {
         const page = await pdfDoc.getPage(slot.num);
         if (destroyed || !pdfDoc || buildRot !== S.rotation) return;
-        const vp1 = page.getViewport({ scale: 1, rotation: 0 });
+        const vp1 = page.getViewport({ scale: 1 });
         updateSingleSlotDim(slot, vp1.width, vp1.height);
 
         const tc = await getPageTextData(slot.num, page);
         if (destroyed || !pdfDoc || buildRot !== S.rotation) return;
 
         const curScale = slotDisplayScale(slot.num);
-        const vp = page.getViewport({ scale: curScale, rotation: buildRot });
+        const vp = page.getViewport({ scale: curScale, rotation: pageTotalRotation(page) });
         slot.el.style.setProperty("--scale-factor", String(curScale));
         if (slot.textLayer) { try { slot.textLayer.cancel(); } catch (e) {} slot.textLayer = null; }
         slot.textWrap.replaceChildren();
@@ -720,6 +776,7 @@
       } finally {
         slot.textBuilding = false;
         activeTextBuilds = Math.max(0, activeTextBuilds - 1);
+        pumpPendingText();
       }
     }
 
@@ -748,7 +805,7 @@
         rawContent,
         items,
         styles: rawContent.styles || {},
-        vp1: page.getViewport({ scale: 1, rotation: 0 }),
+        vp1: page.getViewport({ scale: 1 }),
       };
       S.textCache.set(num, data);
       if (S.textCache.size > MAX_TEXT_CACHE) {
@@ -850,7 +907,7 @@
       if (destroyed || !pdfDoc) return null;
       const page = await pdfDoc.getPage(pageNum);
       if (destroyed || !pdfDoc) return null;
-      const rot = ((extraRotation || 0) % 360 + 360) % 360;
+      const rot = (((page.rotate || 0) + (extraRotation || 0)) % 360 + 360) % 360;
       const vp1 = page.getViewport({ scale: 1, rotation: rot });
       const scale = Math.max(0.12, Math.min(1.2, (maxWidth || 220) / Math.max(1, vp1.width)));
       const vp = page.getViewport({ scale, rotation: rot });
@@ -864,7 +921,8 @@
       await task.promise;
       const url = c.toDataURL("image/jpeg", 0.76);
       c.width = 0; c.height = 0;
-      try { page.cleanup(); } catch (e) {}
+      const s = getSlot(pageNum);
+      if (!s || !s.baseCanvas) { try { page.cleanup(); } catch (e) {} }
       return url;
     }
 
@@ -877,7 +935,7 @@
         if (destroyed || !pdfDoc) return;
         const annots = await page.getAnnotations({ intent: "display" });
         if (destroyed || !annots || !annots.length) return;
-        const vp1 = page.getViewport({ scale: 1, rotation: S.rotation });
+        const vp1 = page.getViewport({ scale: 1, rotation: pageTotalRotation(page) });
         slot.annotEl.replaceChildren();
         for (const a of annots) {
           if (!a.rect || a.rect.length !== 4) continue;
@@ -953,28 +1011,88 @@
       } catch (e) { return S.lastSelectedText || ""; }
     }
 
-    // ---------- Búsqueda ultrarrápida en Worker ----------
+    // ---------- Búsqueda ultrarrápida en Worker (frases entre nodos, sin acentos y rotaciones) ----------
     let searchToken = 0;
-    async function search(query) {
+    function foldSearchText(str) {
+      return String(str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    }
+    function buildPageSearchIndex(items) {
+      let norm = "";
+      const map = []; // cada carácter en norm -> { itemIdx, charIdx } o null (espacio virtual)
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const str = String(it.str || "");
+        if (norm.length > 0 && str.length > 0 && !/\s$/.test(norm) && !/^\s/.test(str)) {
+          const prev = items[i - 1];
+          const prevEndSpace = prev && prev.hasEOL;
+          let needSpace = !!prevEndSpace;
+          if (!needSpace && prev && prev.transform && it.transform) {
+            const dy = Math.abs(it.transform[5] - prev.transform[5]);
+            const fh = Math.hypot(it.transform[2], it.transform[3]) || 10;
+            const gap = it.transform[4] - (prev.transform[4] + (prev.width || 0));
+            if (dy > fh * 0.45 || gap > Math.max(1.5, fh * 0.16)) needSpace = true;
+          }
+          if (needSpace) { norm += " "; map.push(null); }
+        }
+        for (let c = 0; c < str.length; c++) {
+          const folded = foldSearchText(str[c]);
+          for (let k = 0; k < folded.length; k++) {
+            const ch = /\s/.test(folded[k]) ? " " : folded[k];
+            if (ch === " " && norm.endsWith(" ")) continue;
+            norm += ch;
+            map.push({ itemIdx: i, charIdx: c });
+          }
+        }
+      }
+      return { norm, map };
+    }
+
+    async function getItemsForSearch(p) {
+      if (S.textCache.has(p)) return S.textCache.get(p).items;
+      const page = await pdfDoc.getPage(p);
+      if (destroyed || !pdfDoc) return [];
+      const raw = await page.getTextContent({ includeMarkedContent: false });
+      const items = (raw.items || []).filter((it) => typeof it.str === "string");
+      const slot = getSlot(p);
+      if (!slot || !slot.baseCanvas) { try { page.cleanup(); } catch (e) {} }
+      return items;
+    }
+
+    async function search(query, onProgress) {
       const q = String(query || "").trim();
       S.searchQuery = q; S.searchMatches = []; S.searchPos = -1;
       for (const slot of S.slots) slot.hlEl.replaceChildren();
       if (!q || !pdfDoc) return { current: 0, total: 0, label: "" };
 
       const myToken = ++searchToken;
-      const needle = q.toLowerCase();
+      const needle = foldSearchText(q).replace(/\s+/g, " ").trim();
+      if (!needle) return { current: 0, total: 0, label: "" };
       const matches = [];
       for (let p = 1; p <= S.pages; p++) {
         if (myToken !== searchToken || destroyed || !pdfDoc) return null;
-        const data = await getPageTextData(p);
-        for (let i = 0; i < data.items.length; i++) {
-          const str = String(data.items[i].str || "");
-          const low = str.toLowerCase();
-          let at = 0;
-          while ((at = low.indexOf(needle, at)) !== -1) {
-            matches.push({ page: p, itemIdx: i, offset: at, len: needle.length });
-            at += Math.max(1, needle.length);
+        const items = await getItemsForSearch(p);
+        if (myToken !== searchToken || destroyed || !pdfDoc) return null;
+        const { norm, map } = buildPageSearchIndex(items);
+        let at = 0;
+        while ((at = norm.indexOf(needle, at)) !== -1) {
+          const byItem = new Map();
+          for (let k = at; k < at + needle.length; k++) {
+            const ref = map[k];
+            if (!ref) continue;
+            const cur = byItem.get(ref.itemIdx);
+            if (!cur) byItem.set(ref.itemIdx, { itemIdx: ref.itemIdx, start: ref.charIdx, end: ref.charIdx + 1 });
+            else {
+              if (ref.charIdx < cur.start) cur.start = ref.charIdx;
+              if (ref.charIdx + 1 > cur.end) cur.end = ref.charIdx + 1;
+            }
           }
+          const spans = [...byItem.values()].map((sp) => ({ itemIdx: sp.itemIdx, offset: sp.start, len: Math.max(1, sp.end - sp.start) }));
+          if (spans.length) matches.push({ page: p, spans });
+          at += Math.max(1, needle.length);
+        }
+        if (p % 12 === 0) {
+          if (onProgress) onProgress(p, S.pages, matches.length);
+          await new Promise((r) => setTimeout(r, 0));
         }
       }
       if (myToken !== searchToken || destroyed) return null;
@@ -991,46 +1109,69 @@
       S.searchPos = ((idx % total) + total) % total;
       const m = S.searchMatches[S.searchPos];
       if (m.page !== S.page || S.layout === "single") goToPage(m.page, { recordHistory: false, instant: true });
-      for (const slot of findVisibleSlots().visible) paintSearchHighlights(slot);
-      const slot = getSlot(m.page);
-      if (slot) {
-        const activeBox = slot.hlEl.querySelector(".pc-hl-active");
-        if (activeBox) activeBox.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
-      }
+      const targetSlot = getSlot(m.page);
+      const vis = findVisibleSlots().visible;
+      for (const slot of vis) paintSearchHighlights(slot, slot === targetSlot);
+      if (targetSlot && !vis.includes(targetSlot)) paintSearchHighlights(targetSlot, true);
       return { current: S.searchPos + 1, total, label: (S.searchPos + 1) + " de " + total };
     }
 
-    function paintSearchHighlights(slot) {
+    function paintSearchHighlights(slot, scrollActive) {
       slot.hlEl.replaceChildren();
       if (!S.searchQuery || !S.searchMatches.length) return;
       const pageMatches = S.searchMatches.map((m, idx) => ({ m, idx })).filter((x) => x.m.page === slot.num);
       if (!pageMatches.length) return;
       const rot = S.rotation;
+      const qSnap = S.searchQuery;
+      const posSnap = S.searchPos;
       getPageTextData(slot.num).then(async (data) => {
-        if (destroyed || !S.searchQuery || !pdfDoc) return;
+        if (destroyed || S.searchQuery !== qSnap || !pdfDoc || rot !== S.rotation) return;
         const page = await pdfDoc.getPage(slot.num);
-        if (destroyed || !S.searchQuery) return;
-        const vp = page.getViewport({ scale: 1, rotation: rot });
+        if (destroyed || S.searchQuery !== qSnap) return;
+        const vp = page.getViewport({ scale: 1, rotation: pageTotalRotation(page) });
         const frag = document.createDocumentFragment();
+        let activeBox = null;
         for (const { m, idx } of pageMatches) {
-          const item = data.items[m.itemIdx];
-          if (!item || !item.str) continue;
-          const tx = multiplyTransform(vp.transform, item.transform);
-          const fh = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 10;
-          const totalLen = Math.max(1, item.str.length);
-          const itemW = Math.max(4, item.width || (totalLen * fh * 0.52));
-          const xStart = tx[4] + (m.offset / totalLen) * itemW;
-          const w = Math.max(6, (m.len / totalLen) * itemW);
-          const yTop = tx[5] - fh * 0.92;
-          const box = document.createElement("div");
-          box.className = "pc-hl-box" + (idx === S.searchPos ? " pc-hl-active" : "");
-          box.style.left = ((xStart / vp.width) * 100).toFixed(3) + "%";
-          box.style.top = ((yTop / vp.height) * 100).toFixed(3) + "%";
-          box.style.width = ((w / vp.width) * 100).toFixed(3) + "%";
-          box.style.height = (((fh * 1.15) / vp.height) * 100).toFixed(3) + "%";
-          frag.append(box);
+          const isAct = idx === posSnap;
+          for (const sp of (m.spans || [m])) {
+            const item = data.items[sp.itemIdx];
+            if (!item || !item.str) continue;
+            const tx = multiplyTransform(vp.transform, item.transform);
+            const fh = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 10;
+            const totalLen = Math.max(1, item.str.length);
+            const itemW = Math.max(4, item.width || (totalLen * fh * 0.52));
+            const dirLen = Math.hypot(tx[0], tx[1]) || 1;
+            const bx = tx[0] / dirLen, by = tx[1] / dirLen; // vector dirección de línea
+            const ax = -tx[2] / (Math.hypot(tx[2], tx[3]) || 1), ay = -tx[3] / (Math.hypot(tx[2], tx[3]) || 1); // vector hacia arriba del glifo
+            const s0 = (sp.offset / totalLen) * itemW;
+            const s1 = Math.max(s0 + 6, ((sp.offset + sp.len) / totalLen) * itemW);
+            const x0 = tx[4] + bx * s0, y0 = tx[5] + by * s0;
+            const x1 = tx[4] + bx * s1, y1 = tx[5] + by * s1;
+            const hUp = fh * 0.94, hDn = fh * 0.22;
+            const pts = [
+              [x0 + ax * hUp, y0 + ay * hUp],
+              [x1 + ax * hUp, y1 + ay * hUp],
+              [x0 - ax * hDn, y0 - ay * hDn],
+              [x1 - ax * hDn, y1 - ay * hDn],
+            ];
+            const minX = Math.min(...pts.map((p) => p[0]));
+            const maxX = Math.max(...pts.map((p) => p[0]));
+            const minY = Math.min(...pts.map((p) => p[1]));
+            const maxY = Math.max(...pts.map((p) => p[1]));
+            const box = document.createElement("div");
+            box.className = "pc-hl-box" + (isAct ? " pc-hl-active" : "");
+            box.style.left = ((minX / vp.width) * 100).toFixed(3) + "%";
+            box.style.top = ((minY / vp.height) * 100).toFixed(3) + "%";
+            box.style.width = ((Math.max(6, maxX - minX) / vp.width) * 100).toFixed(3) + "%";
+            box.style.height = ((Math.max(8, maxY - minY) / vp.height) * 100).toFixed(3) + "%";
+            if (isAct && !activeBox) activeBox = box;
+            frag.append(box);
+          }
         }
         slot.hlEl.replaceChildren(frag);
+        if (scrollActive && activeBox && activeBox.isConnected) {
+          activeBox.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+        }
       }).catch(() => {});
     }
 
@@ -1050,7 +1191,7 @@
           for (const it of items) {
             const page = it.dest ? await resolveDestPage(it.dest) : null;
             flat.push({ title: String(it.title || "").trim() || "Sección", page: page || 1, depth });
-            if (it.items && it.items.length && depth < 3) await walk(it.items, depth + 1);
+            if (it.items && it.items.length && depth < 5) await walk(it.items, depth + 1);
           }
         };
         await walk(raw, 0);
@@ -1168,7 +1309,7 @@
 
       if (anchor && anchor.slot && anchor.slot.el.isConnected) {
         const el = anchor.slot.el;
-        const pageLeft = el.offsetLeft + stage.offsetLeft;
+        const pageLeft = el.getBoundingClientRect().left - scroller.getBoundingClientRect().left + scroller.scrollLeft;
         const pageTop = anchor.slot.top;
         const maxSL = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
         const maxST = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -1249,9 +1390,11 @@
       if (!pdfDoc) return;
       S.rotation = (S.rotation + 90) % 360;
       const cur = S.page;
-      S.refWidth = pageRotatedSize(cur).w;
+      S.refWidth = S.rotation % 180 === 90 ? S.refDim.h : S.refDim.w;
       S.fitScale = computeFitScale(cur);
       S.scale = S.fitScale;
+      S.minScale = Math.max(0.22, S.fitScale * 0.65);
+      S.maxScale = Math.max(4.5, S.fitScale * 6.5);
       releaseAllCanvases();
       releaseAllTextLayers();
       for (const slot of S.slots) { slot.annotLoaded = false; slot.annotEl.replaceChildren(); }
@@ -1303,7 +1446,11 @@
       }
 
       function onTouchStart(e) {
-        if (e.touches.length >= 2) { e.preventDefault(); startPinch(e.touches[0], e.touches[1]); return; }
+        if (e.touches.length >= 2) {
+          if (e.cancelable) e.preventDefault();
+          if (!pinch) startPinch(e.touches[0], e.touches[1]);
+          return;
+        }
         if (pinch) return;
         if (e.target && e.target.closest && e.target.closest(".pc-pdf-link, .pc-pdf-field")) return;
         const t = e.touches[0], now = performance.now();
@@ -1312,7 +1459,7 @@
 
       function onTouchMove(e) {
         if (pinch) {
-          e.preventDefault();
+          if (e.cancelable) e.preventDefault();
           const a = Array.prototype.find.call(e.touches, (t) => t.identifier === pinch.a) || e.touches[0];
           const b = Array.prototype.find.call(e.touches, (t) => t.identifier === pinch.b) || e.touches[1];
           if (!a || !b) return;
@@ -1336,15 +1483,16 @@
           }
         }
         if (tap.swiping) {
-          e.preventDefault();
-          swipeDx = dx * 0.48;
+          if (e.cancelable) e.preventDefault();
+          const atEdge = (dx > 0 && S.page <= 1) || (dx < 0 && S.page >= S.pages);
+          swipeDx = dx * (atEdge ? 0.16 : 0.48);
           stage.style.transform = `translate3d(${swipeDx.toFixed(1)}px,0,0)`;
         }
       }
 
       function onTouchEnd(e) {
         if (pinch) {
-          if (e.touches.length < 2) { e.preventDefault(); finishPinch(e.type === "touchcancel"); }
+          if (e.touches.length < 2) { if (e.cancelable) e.preventDefault(); finishPinch(e.type === "touchcancel"); }
           return;
         }
         if (!tap) return;
@@ -1449,6 +1597,7 @@
     // ---------- Ciclo de vida: open / close / resize ----------
     async function open(container, blobOrBytes, options) {
       close();
+      const myEpoch = ++openEpoch;
       destroyed = false;
       host = container;
       opts = options || {};
@@ -1461,17 +1610,19 @@
       S.searchQuery = ""; S.searchMatches = []; S.searchPos = -1; S.lastSelectedText = "";
 
       pdfjs = await loadPdfJs();
-      if (destroyed) return null;
+      if (destroyed || myEpoch !== openEpoch) return null;
 
       let loadingTask;
+      let myTransport = null;
       if (blobOrBytes instanceof Blob && blobOrBytes.size > 0 && pdfjs.PDFDataRangeTransport) {
         // Para libros de cualquier tamaño (incluidos 100-400 MB): streaming por rangos de 128 KB vía Blob.slice()!
         const initSize = Math.min(65536, blobOrBytes.size);
         const initBuf = new Uint8Array(await blobOrBytes.slice(0, initSize).arrayBuffer());
-        if (destroyed) return null;
+        if (destroyed || myEpoch !== openEpoch) return null;
         if (blobOrBytes.size <= 2 * 1024 * 1024) {
           // PDFs pequeños (<= 2 MB): carga directa inmediata en 0 viajes
           const full = initSize === blobOrBytes.size ? initBuf : new Uint8Array(await blobOrBytes.arrayBuffer());
+          if (destroyed || myEpoch !== openEpoch) return null;
           loadingTask = pdfjs.getDocument({
             data: full,
             standardFontDataUrl: "./pdfjs/standard_fonts/",
@@ -1479,9 +1630,10 @@
             useSystemFonts: true,
           });
         } else {
-          rangeTransport = makeBlobRangeTransport(pdfjs, blobOrBytes, initBuf);
+          myTransport = makeBlobRangeTransport(pdfjs, blobOrBytes, initBuf);
+          rangeTransport = myTransport;
           loadingTask = pdfjs.getDocument({
-            range: rangeTransport,
+            range: myTransport,
             length: blobOrBytes.size,
             standardFontDataUrl: "./pdfjs/standard_fonts/",
             isEvalSupported: false,
@@ -1497,6 +1649,7 @@
           : blobOrBytes instanceof ArrayBuffer
             ? new Uint8Array(blobOrBytes.slice(0))
             : new Uint8Array(await blobOrBytes.arrayBuffer());
+        if (destroyed || myEpoch !== openEpoch) return null;
         loadingTask = pdfjs.getDocument({
           data: bytes,
           standardFontDataUrl: "./pdfjs/standard_fonts/",
@@ -1504,39 +1657,48 @@
           useSystemFonts: true,
         });
       }
+      activeLoadingTask = loadingTask;
 
+      let loadedDoc;
       try {
-        pdfDoc = await loadingTask.promise;
+        loadedDoc = await loadingTask.promise;
       } catch (err) {
+        if (activeLoadingTask === loadingTask) activeLoadingTask = null;
+        if (myTransport) { myTransport.abort(); if (rangeTransport === myTransport) rangeTransport = null; }
+        if (destroyed || myEpoch !== openEpoch) return null;
         if (err && (err.name === "PasswordException" || /password/i.test(String(err.message || "")))) {
-          if (rangeTransport) { rangeTransport.abort(); rangeTransport = null; }
           const e = new Error("PDF protegido con contraseña");
           e.code = "PASSWORD_REQUIRED";
           throw e;
         }
         throw err;
       }
-      if (destroyed) {
-        pdfDoc.destroy().catch(() => {}); pdfDoc = null;
-        if (rangeTransport) { rangeTransport.abort(); rangeTransport = null; }
+      if (activeLoadingTask === loadingTask) activeLoadingTask = null;
+      if (destroyed || myEpoch !== openEpoch) {
+        loadedDoc.destroy().catch(() => {});
+        if (myTransport) { myTransport.abort(); if (rangeTransport === myTransport) rangeTransport = null; }
         return null;
       }
+      pdfDoc = loadedDoc;
 
       S.pages = pdfDoc.numPages || 1;
       S.page = Math.max(1, Math.min(S.pages, S.page));
 
-      // Muestrear página 1 y una página interior (si el libro tiene >= 3 págs) para obtener el ancho real de texto
+      // Muestrear página 1 y una página interior (respetando page.rotate intrínseco) para obtener el ancho real
       const p1 = await pdfDoc.getPage(1);
-      const vp1 = p1.getViewport({ scale: 1, rotation: 0 });
+      if (destroyed || myEpoch !== openEpoch) return null;
+      const vp1 = p1.getViewport({ scale: 1 });
       let refDim = { w: vp1.width, h: vp1.height };
       if (S.pages >= 3) {
         try {
           const sampleNum = Math.min(S.pages, S.pages >= 8 ? 5 : 3);
           const pMid = await pdfDoc.getPage(sampleNum);
-          const vpMid = pMid.getViewport({ scale: 1, rotation: 0 });
+          if (destroyed || myEpoch !== openEpoch) return null;
+          const vpMid = pMid.getViewport({ scale: 1 });
           if (vpMid.width > 100 && vpMid.height > 100) refDim = { w: vpMid.width, h: vpMid.height };
         } catch (e) {}
       }
+      S.refDim = refDim;
       S.pageDims = Array.from({ length: S.pages }, (_, idx) => (idx === 0 ? { w: vp1.width, h: vp1.height } : { w: refDim.w, h: refDim.h }));
       S.refWidth = S.rotation % 180 === 90 ? refDim.h : refDim.w;
 
@@ -1573,6 +1735,7 @@
     }
 
     function close() {
+      openEpoch++;
       destroyed = true;
       clearTimeout(renderTimer); clearTimeout(hdTimer); clearTimeout(zoomAnimTimer); clearTimeout(selTimer);
       if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = 0; }
@@ -1583,6 +1746,7 @@
       cancelAllRenders(); releaseAllCanvases(); releaseAllTextLayers();
       S.slots = []; S.textCache.clear(); S.outline = null;
       S.searchQuery = ""; S.searchMatches = []; S.lastSelectedText = "";
+      if (activeLoadingTask) { const lt = activeLoadingTask; activeLoadingTask = null; lt.destroy().catch(() => {}); }
       if (pdfDoc) { const d = pdfDoc; pdfDoc = null; d.destroy().catch(() => {}); }
       if (rangeTransport) { rangeTransport.abort(); rangeTransport = null; }
       if (host) host.replaceChildren();

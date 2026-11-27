@@ -4,6 +4,7 @@
 const VERSION = "__VERSION__";
 const PDFCRAFT = "__PDFCRAFT__";
 const CACHE = "pdfcraft-" + VERSION;
+const MODELS_CACHE = "pdfcraft-models-v1";
 const PRECACHE = __PRECACHE__;
 const WASM = "./__WASM__";
 const WASM_BYTES = __WASM_BYTES__;
@@ -13,26 +14,51 @@ async function broadcast(message) {
   windows.forEach((client) => client.postMessage(message));
 }
 
+// Transmite el .wasm directamente a Cache Storage sin acumular 69 MB en la RAM del Service Worker de iOS.
 async function fetchWasm() {
   const response = await fetch(new Request(WASM, { cache: "reload" }));
   if (!response.ok) throw new Error("No se pudo bajar la app (" + response.status + ")");
-  if (!response.body) return response;
+  if (!response.body || typeof ReadableStream !== "function") return response;
   const reader = response.body.getReader();
-  const chunks = [];
   let loaded = 0;
   let reported = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    loaded += value.byteLength;
-    if (loaded - reported > 512 * 1024) {
-      reported = loaded;
-      broadcast({ type: "progress", loaded, total: WASM_BYTES });
-    }
+  const stream = new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        broadcast({ type: "progress", loaded: Math.max(loaded, WASM_BYTES), total: WASM_BYTES });
+        controller.close();
+        return;
+      }
+      loaded += value.byteLength;
+      if (loaded - reported > 512 * 1024) {
+        reported = loaded;
+        broadcast({ type: "progress", loaded, total: WASM_BYTES });
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) { return reader.cancel(reason); }
+  });
+  return new Response(stream, { headers: { "Content-Type": "application/wasm" } });
+}
+
+async function cacheInBatches(cache, urls) {
+  const BATCH = 6;
+  for (let i = 0; i < urls.length; i += BATCH) {
+    const slice = urls.slice(i, i + BATCH);
+    await Promise.all(slice.map(async (url) => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const resp = await fetch(new Request(url, { cache: "reload" }));
+          if (!resp.ok) throw new Error("HTTP " + resp.status + " en " + url);
+          await cache.put(url, resp);
+          return;
+        } catch (err) {
+          if (attempt === 1) throw err;
+        }
+      }
+    }));
   }
-  broadcast({ type: "progress", loaded, total: WASM_BYTES });
-  return new Response(new Blob(chunks, { type: "application/wasm" }), { headers: { "Content-Type": "application/wasm" } });
 }
 
 const HASHED = /-[0-9a-f]{16}(_bg|_loader)?\.(wasm|js)$/;
@@ -51,7 +77,7 @@ self.addEventListener("install", (event) => {
     for (const url of PRECACHE) {
       if (url !== WASM && !(await reuse(cache, url))) rest.push(url);
     }
-    await cache.addAll(rest.map((url) => new Request(url, { cache: "reload" })));
+    await cacheInBatches(cache, rest);
     if (!(await reuse(cache, WASM))) await cache.put(WASM, await fetchWasm());
     await self.skipWaiting();
   })().catch((error) => {
@@ -63,8 +89,9 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
     // El caché nuevo ya contiene todos los archivos (incluido el .wasm reutilizado):
-    // se eliminan cachés viejos para no duplicar ~70 MB en el almacenamiento del iPhone.
-    const older = (await caches.keys()).filter((key) => key.startsWith("pdfcraft-") && key !== CACHE);
+    // se eliminan cachés viejos para no duplicar ~70 MB en el almacenamiento del iPhone,
+    // preservando los modelos de OCR descargados.
+    const older = (await caches.keys()).filter((key) => key.startsWith("pdfcraft-") && key !== CACHE && key !== MODELS_CACHE);
     await Promise.all(older.map((key) => caches.delete(key)));
     await self.clients.claim();
     broadcast({ type: "activated", version: PDFCRAFT });
@@ -86,12 +113,18 @@ self.addEventListener("fetch", (event) => {
   }
 
   event.respondWith((async () => {
-    const cache = await caches.open(CACHE);
+    const isModel = url.pathname.includes("/models/");
+    const targetCacheName = isModel ? MODELS_CACHE : CACHE;
+    const cache = await caches.open(targetCacheName);
     const hit = (await cache.match(request, { ignoreSearch: true })) ||
       (await caches.match(request, { ignoreSearch: true }));
     if (hit) return hit;
-    const response = await fetch(request);
-    if (response.ok && response.type === "basic") cache.put(request, response.clone()).catch(() => {});
-    return response;
+    try {
+      const response = await fetch(request);
+      if (response.ok && response.type === "basic") cache.put(request, response.clone()).catch(() => {});
+      return response;
+    } catch (e) {
+      return new Response("Sin conexión", { status: 503, statusText: "Offline" });
+    }
   })());
 });

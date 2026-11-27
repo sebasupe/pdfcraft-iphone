@@ -230,6 +230,15 @@
       t.objectStore("meta").delete(id);
       t.objectStore("datos").delete(id);
       await new Promise((resolve, reject) => { t.oncomplete = resolve; t.onerror = () => reject(t.error); });
+      try {
+        const spaces = await files.listSpaces();
+        for (const sp of spaces) {
+          if (sp.archivos && sp.archivos.includes(id)) {
+            sp.archivos = sp.archivos.filter((x) => x !== id);
+            await files.saveSpace(sp);
+          }
+        }
+      } catch (e) {}
     },
     async trim() {
       const all = await files.list();
@@ -319,15 +328,34 @@
     ttsBlocks: [],
     ttsIdx: 0,
     ttsPage: 1,
+    ttsGen: 0,
+    ttsLabel: "",
+    ttsLang: "auto", // "auto" | "es" | "en"
     readerLayout: "continuous",
     readerPageGaps: true,
     readerRotation: 0,
     vthumbDragging: false,
     lastSelectionText: "",
+    openSeq: 0,
+    homeDialogActive: false,
+    lastSearchedQuery: "",
   };
   const reader = window.pdfcraftReader ? window.pdfcraftReader.create() : null;
   const readerEl = $("pc-reader");
   const liquidEl = $("pc-liquid");
+
+  function syncGesturesEnabled() {
+    if (!gestures || !gestures.setEnabled) return;
+    const inViewer = body.classList.contains("pc-in-viewer");
+    const orgOpen = !!(window.pdfcraftOrganizer && window.pdfcraftOrganizer.isOpen());
+    const useCanvas = inViewer && !S.fastReader && !S.liquidMode && !orgOpen;
+    gestures.setEnabled(useCanvas);
+  }
+
+  function safePutMeta(meta) {
+    if (!meta || meta._ephemeral || meta._pendingSave) return Promise.resolve();
+    return files.putMeta(meta).catch(() => {});
+  }
 
   function setFastReader(on) {
     const want = !!(on && reader && reader.isOpen());
@@ -339,12 +367,17 @@
       body.classList.remove("pc-modal");
     }
     if (readerEl) readerEl.hidden = !want || S.liquidMode;
+    syncGesturesEnabled();
   }
 
-  async function ensureEngineReady() {
+  async function ensureEngineReady(statusMsg) {
     if (S.ready) return true;
+    if (statusMsg) busy(true, statusMsg);
+    if (window.pdfcraftBootEngine) {
+      await window.pdfcraftBootEngine();
+    }
     for (let i = 0; i < 450 && !S.ready; i++) await sleep(100);
-    if (!S.ready) throw new Error("El motor de edición aún está iniciando. Intenta en unos segundos.");
+    if (!S.ready) throw new Error("El motor de edición no pudo iniciarse. Revisa tu conexión o vuelve a intentarlo.");
     return true;
   }
 
@@ -393,7 +426,7 @@
     { id: "espacio",   cat: "crear",     t: "Crea un Espacio PDF", d: "Agrupa tus libros y apuntes en una colección",     i: "spaces",    tint: "purple", action: "newSpace" },
     { id: "organizar", cat: "organizar", t: "Organizar páginas",   d: "Gira, mueve, inserta, extrae y elimina páginas",   i: "organize",  tint: "lime",   docAction: "organize" },
     { id: "recortar",  cat: "organizar", t: "Recortar páginas",    d: "Recorta márgenes o cambia el tamaño de página",    i: "crop",      tint: "blue",   cmd: "page.boxes" },
-    { id: "dividir",   cat: "organizar", t: "Dividir PDF",         d: "Separa un documento largo en partes más pequeñas", i: "split",     tint: "emerald",docAction: "organize" },
+    { id: "dividir",   cat: "organizar", t: "Dividir PDF",         d: "Separa un documento largo en partes más pequeñas", i: "split",     tint: "emerald",docAction: "split" },
     { id: "editar",    cat: "editar",    t: "Editar PDF",          d: "Modifica o añade texto, imágenes y enlaces",       i: "editBox",   tint: "pink",   mode: "editar" },
     { id: "dibujar",   cat: "editar",    t: "Dibujar a mano",      d: "Subraya y dibuja libremente sobre las páginas",    i: "draw",      tint: "red",    mode: "dibujar" },
     { id: "ocr",       cat: "editar",    t: "Reconocer texto",     d: "Aplica OCR para hacer buscables tus escaneos",     i: "ocr",       tint: "emerald",cmd: "ocr.recognize" },
@@ -545,6 +578,10 @@
     const installingOffline = !!(navigator.serviceWorker && window.isSecureContext && !navigator.serviceWorker.controller);
     if (!installingOffline && window.pdfcraftHideSplash) {
       window.pdfcraftHideSplash();
+    } else if (installingOffline && window.pdfcraftWaitFirstInstall) {
+      window.pdfcraftWaitFirstInstall().finally(() => {
+        if (window.pdfcraftHideSplash) window.pdfcraftHideSplash();
+      });
     }
     document.addEventListener("visibilitychange", () => {
       syncWakeLock();
@@ -640,6 +677,7 @@
       onLongPress: (x, y) => { restoreSelectNow(); hideSelectionBar(); showPressRing(x, y); },
       onSelectEnd: (x, y, moved) => { if (moved && !S.mode && !S.modal && !S.desktop && !S.panel) showSelectionBar(); },
     });
+    syncGesturesEnabled();
 
     if (window.pdfcraftHideSplash) window.pdfcraftHideSplash();
     setInterval(tick, 500);
@@ -783,6 +821,11 @@
         body.classList.toggle("pc-modal", modal);
         if (modal) { busy(false); hideSelectionBar(); hideAnnotBar(); setImmersive(false); }
         await applyScale();
+        if (!modal && S.homeDialogActive && !S.doc && !S.desktop) {
+          S.homeDialogActive = false;
+          showHome();
+          return;
+        }
       } else if (modal && !combineOpen) {
         await fitDialog(s);
       }
@@ -890,7 +933,7 @@
       }
     }
     if (track && thumb) {
-      track.hidden = isSingle;
+      track.hidden = isSingle || pages <= 1;
       if (!track.hidden) {
         if (thumb.textContent !== String(page)) thumb.textContent = String(page);
         const frac = typeof scrollFraction === "number"
@@ -900,6 +943,20 @@
         thumb.style.top = Math.round(Math.max(0, Math.min(1, frac)) * maxTop) + "px";
       }
     }
+  }
+
+  function showZoomPill(pct) {
+    let pill = $("pc-zoom-pill");
+    if (!pill) {
+      const docEl = $("pc-doc");
+      if (!docEl) return;
+      pill = h("div", { id: "pc-zoom-pill", class: "pc-zoom-pill", "aria-hidden": "true" });
+      docEl.append(pill);
+    }
+    pill.textContent = Math.round(pct) + " %";
+    pill.classList.add("pc-show");
+    clearTimeout(showZoomPill.t);
+    showZoomPill.t = setTimeout(() => { pill.classList.remove("pc-show"); }, 850);
   }
 
   function updateBackJumpChip(targetPage) {
@@ -917,7 +974,7 @@
     if (!S.doc || !S.doc.meta || !S.doc.page) return;
     if (S.doc.meta.ultimaPagina === S.doc.page) return;
     S.doc.meta.ultimaPagina = S.doc.page;
-    files.putMeta(S.doc.meta).catch(() => {});
+    safePutMeta(S.doc.meta);
   }
 
   function syncTool(s) {
@@ -965,14 +1022,26 @@
 
     function startVThumb(ev) {
       if (!S.doc) return;
-      const pt = ev.touches ? ev.touches[0] : ev;
-      dragStart = { y0: pt.clientY, moved: false };
+      const isTouch = !!ev.touches;
+      const pt = isTouch ? ev.touches[0] : ev;
+      dragStart = { y0: pt.clientY, moved: false, isTouch, id: isTouch ? pt.identifier : null };
       if (ev.cancelable) ev.preventDefault();
       ev.stopPropagation();
+      if (isTouch) {
+        window.addEventListener("touchmove", moveVThumb, { passive: false });
+        window.addEventListener("touchend", endVThumb);
+        window.addEventListener("touchcancel", endVThumb);
+      } else {
+        window.addEventListener("pointermove", moveVThumbMouse);
+        window.addEventListener("pointerup", endVThumbMouse);
+        window.addEventListener("pointercancel", endVThumbMouse);
+      }
     }
     function moveVThumb(ev) {
       if (!dragStart || !S.doc) return;
-      const pt = ev.touches ? ev.touches[0] : ev;
+      const pt = ev.touches
+        ? Array.prototype.find.call(ev.touches, (t) => t.identifier === dragStart.id) || ev.touches[0]
+        : ev;
       if (!pt) return;
       if (ev.cancelable) ev.preventDefault();
       if (!dragStart.moved && Math.abs(pt.clientY - dragStart.y0) > 6) {
@@ -983,11 +1052,13 @@
       }
       if (!dragStart.moved) return;
       const tr = track.getBoundingClientRect();
+      const docR = $("pc-doc").getBoundingClientRect();
       const th = thumb.offsetHeight || 34;
       const maxTop = Math.max(1, tr.height - th);
       const frac = Math.max(0, Math.min(1, (pt.clientY - tr.top - th / 2) / maxTop));
       thumb.style.top = Math.round(frac * maxTop) + "px";
-      tip.style.top = Math.round(tr.top - $("pc-doc").getBoundingClientRect().top + frac * maxTop + th / 2) + "px";
+      const rawTipTop = Math.round(tr.top - docR.top + frac * maxTop + th / 2);
+      tip.style.top = Math.max(24, Math.min(docR.height - 24, rawTipTop)) + "px";
       let pg = Math.max(1, Math.min(S.doc.pages, Math.round(1 + frac * (S.doc.pages - 1))));
       if (S.fastReader && reader && reader.isOpen()) {
         pg = reader.scrollToFraction(frac);
@@ -999,10 +1070,19 @@
       thumb.textContent = String(pg);
       tip.textContent = "Pág. " + pg + " de " + S.doc.pages;
     }
+    function detachVThumb() {
+      window.removeEventListener("touchmove", moveVThumb, { passive: false });
+      window.removeEventListener("touchend", endVThumb);
+      window.removeEventListener("touchcancel", endVThumb);
+      window.removeEventListener("pointermove", moveVThumbMouse);
+      window.removeEventListener("pointerup", endVThumbMouse);
+      window.removeEventListener("pointercancel", endVThumbMouse);
+    }
     function endVThumb() {
       if (!dragStart) return;
       const wasMoved = dragStart.moved;
       dragStart = null;
+      detachVThumb();
       S.vthumbDragging = false;
       thumb.classList.remove("pc-dragging");
       tip.hidden = true;
@@ -1014,14 +1094,11 @@
         saveLastPage();
       }
     }
+    function moveVThumbMouse(e) { if (e.pointerType === "mouse") moveVThumb(e); }
+    function endVThumbMouse(e) { if (e.pointerType === "mouse") endVThumb(); }
 
     thumb.addEventListener("touchstart", startVThumb, { passive: false });
-    window.addEventListener("touchmove", moveVThumb, { passive: false });
-    window.addEventListener("touchend", endVThumb);
-    window.addEventListener("touchcancel", endVThumb);
     thumb.addEventListener("pointerdown", (e) => { if (e.pointerType === "mouse") startVThumb(e); });
-    window.addEventListener("pointermove", (e) => { if (e.pointerType === "mouse") moveVThumb(e); });
-    window.addEventListener("pointerup", (e) => { if (e.pointerType === "mouse") endVThumb(); });
 
     renderTabBar();
   }
@@ -1129,6 +1206,13 @@
     if (S.homeFilter === "destacados") items = items.filter((m) => m.destacado);
     items = sortFiles(items);
 
+    if (S.homeFilter === "iphone") {
+      const totalBytes = S.cachedList.reduce((acc, m) => acc + (m.tamano || 0), 0);
+      nodes.push(h("div", { class: "pc-iphone-bar" },
+        h("span", { text: S.cachedList.length + (S.cachedList.length === 1 ? " PDF local" : " PDFs locales") + " · " + sizeText(totalBytes) }),
+        h("button", { class: "pc-sec-link", type: "button", text: "+ Importar", onclick: () => pickFile(null) })));
+    }
+
     if (items.length) {
       nodes.push(renderFileList(items));
     } else {
@@ -1141,7 +1225,11 @@
           : null));
     }
 
+    const prevTabs = bodyEl.querySelector(".pc-utabs");
+    const prevTabScroll = prevTabs ? prevTabs.scrollLeft : 0;
     bodyEl.replaceChildren(...nodes);
+    const nextTabs = bodyEl.querySelector(".pc-utabs");
+    if (nextTabs && prevTabScroll) nextTabs.scrollLeft = prevTabScroll;
   }
 
   // ---------- Pestaña 2: Espacios (Colecciones locales de PDF, Captura 1) ----------
@@ -1570,18 +1658,27 @@
     });
     input.addEventListener("input", () => { S.toolsQuery = input.value; clearBtn.hidden = !input.value; renderToolsBody(); });
 
+    const catRow = h("div", { class: "pc-utabs", role: "tablist" });
+    const catBtns = TOOL_CATS.map(([id, label]) => h("button", {
+      class: "pc-utab", type: "button", role: "tab",
+      "aria-selected": String(S.toolsCat === id),
+      text: label,
+      onclick: (ev) => {
+        S.toolsCat = id;
+        catBtns.forEach((b, idx) => b.setAttribute("aria-selected", String(TOOL_CATS[idx][0] === id)));
+        if (ev.currentTarget && ev.currentTarget.scrollIntoView) {
+          ev.currentTarget.scrollIntoView({ inline: "nearest", block: "nearest", behavior: "smooth" });
+        }
+        renderToolsBody();
+      },
+    }));
+    catRow.append(...catBtns);
+
     $("pc-app-head").replaceChildren(
       topBrandRow(null, null),
       h("h1", { class: "pc-page-title", text: "Herramientas" }),
       h("label", { class: "pc-search-line" }, h("span", { icon: "search" }), input, clearBtn),
-      h("div", { class: "pc-utabs-row", style: "margin-top:4px" },
-        h("div", { class: "pc-utabs", role: "tablist" },
-          TOOL_CATS.map(([id, label]) => h("button", {
-            class: "pc-utab", type: "button", role: "tab",
-            "aria-selected": String(S.toolsCat === id),
-            text: label,
-            onclick: () => { S.toolsCat = id; renderToolsTab(); },
-          }))))
+      h("div", { class: "pc-utabs-row", style: "margin-top:4px" }, catRow)
     );
     renderToolsBody();
   }
@@ -1727,7 +1824,11 @@
           if (!clean) return;
           meta.nombre = clean.replace(/\.pdf$/i, "") + ".pdf";
           await files.putMeta(meta).catch(() => {});
-          if (S.doc && S.doc.meta.id === meta.id) S.doc.meta.nombre = meta.nombre;
+          if (S.doc && S.doc.meta.id === meta.id) {
+            S.doc.meta.nombre = meta.nombre;
+            S.doc.name = meta.nombre;
+            renderTop();
+          }
           await reloadLibrary();
           if (!body.classList.contains("pc-in-viewer")) renderShell();
           close();
@@ -1881,7 +1982,7 @@
     let paper = "auto";
     const nameInput = h("input", {
       class: "pc-field", type: "text",
-      value: "Escaneo " + new Date().toLocaleDateString("es", { day: "2-digit", month: "2-digit" }).replace("/", "-"),
+      value: "Escaneo " + new Date().toLocaleDateString("es", { day: "2-digit", month: "2-digit" }).replace(/\//g, "-"),
       placeholder: "Nombre del PDF",
     });
     const listWrap = h("div", { class: "pc-scan-list" });
@@ -1932,13 +2033,24 @@
 
     const close = sheet({
       title: "Fotos / Escáner a PDF",
-      onClose: () => { gal.removeEventListener("change", onGal); cam.removeEventListener("change", onCam); },
+      onClose: () => {
+        gal.removeEventListener("change", onGal);
+        cam.removeEventListener("change", onCam);
+        pages.forEach((p) => { if (p.img) p.img.src = ""; });
+      },
       build: () => {
         createBtn.addEventListener("click", async () => {
           if (!pages.length) return;
           createBtn.disabled = true; createBtn.textContent = "Generando PDF…";
           try {
-            const file = await window.pdfcraftScanner.buildPdf(pages.map((p) => ({ img: p.img, rot: p.rot, filter })), { name: nameInput.value.trim() || "Escaneo.pdf", paper });
+            const file = await window.pdfcraftScanner.buildPdf(
+              pages.map((p) => ({ img: p.img, rot: p.rot, filter })),
+              {
+                name: nameInput.value.trim() || "Escaneo.pdf",
+                paper,
+                onProgress: (done, tot) => { createBtn.textContent = `Procesando ${done} de ${tot}…`; },
+              }
+            );
             const meta = { id: newId(), nombre: file.name, tamano: file.size, abierto: Date.now(), modificado: Date.now(), paginas: pages.length };
             await files.save(meta, file);
             await reloadLibrary();
@@ -2155,10 +2267,25 @@
       return;
     }
     // Abrir primero al instante (crítico para libros de 100–380 MB) y guardar copia en segundo plano sin competir por I/O
+    meta._pendingSave = true;
     openDocument(meta, file, tool);
     const saveDelay = file.size > 20 * 1024 * 1024 ? 1800 : 0;
     setTimeout(() => {
-      files.save(meta, file).then(() => reloadLibrary()).catch(() => {
+      const cleanMeta = Object.assign({}, meta);
+      delete cleanMeta._pendingSave;
+      delete cleanMeta._ephemeral;
+      files.save(cleanMeta, file).then(() => {
+        delete meta._pendingSave;
+        delete meta._ephemeral;
+        // Sincronizar página/miniatura capturadas mientras se guardaba en segundo plano
+        if (meta.paginas) cleanMeta.paginas = meta.paginas;
+        if (meta.miniatura) cleanMeta.miniatura = meta.miniatura;
+        if (meta.ultimaPagina) cleanMeta.ultimaPagina = meta.ultimaPagina;
+        return files.putMeta(cleanMeta).catch(() => {});
+      }).then(() => reloadLibrary()).catch(() => {
+        delete meta._pendingSave;
+        meta._ephemeral = true;
+        files.remove(meta.id).catch(() => {});
         toast("Libro abierto en lectura directa (muy grande para copia local).", 3600);
       });
     }, saveDelay);
@@ -2215,7 +2342,13 @@
         onFirstThumb: (dataUrl) => {
           if (!meta.miniatura && dataUrl) {
             meta.miniatura = dataUrl;
-            files.putMeta(meta).catch(() => {});
+            safePutMeta(meta);
+          }
+        },
+        onZoomChange: (pct) => {
+          if (S.doc && !S.opening && !S.liquidMode && reader && reader.isOpen()) {
+            const fit = reader.getState().fitZoomPercent || pct;
+            if (Math.abs(pct - fit) > 2) showZoomPill(pct);
           }
         },
         onFormTap: async (pg) => {
@@ -2228,8 +2361,13 @@
       if (!info) return false;
       S.doc.pages = info.pages;
       S.doc.page = info.page;
-      if (meta.paginas !== info.pages) { meta.paginas = info.pages; files.putMeta(meta).catch(() => {}); }
+      if (meta.paginas !== info.pages) { meta.paginas = info.pages; safePutMeta(meta); }
       updatePageIndicator(info.page, info.pages);
+      if (!meta.miniatura && info.page > 1 && reader && reader.renderThumbnail) {
+        reader.renderThumbnail(1, 220, 0).then((url) => {
+          if (url && !meta.miniatura) { meta.miniatura = url; safePutMeta(meta); }
+        }).catch(() => {});
+      }
       return true;
     } catch (e) {
       setFastReader(false);
@@ -2322,7 +2460,9 @@
   }
 
   async function openDocument(meta, blob, tool) {
+    const mySeq = ++S.openSeq;
     S.opening = true;
+    S.homeDialogActive = false;
     S.modal = false;
     body.classList.remove("pc-modal", "pc-desktop", "pc-panel", "pc-immersive");
     setImmersive(false);
@@ -2334,6 +2474,7 @@
     busy(true, "Abriendo " + meta.nombre + "…");
     try {
       if (!(await closeAll())) { busy(false); return; }
+      if (mySeq !== S.openSeq) return;
       showViewer();
       renderTop(meta.nombre);
       busy(true, "Abriendo " + meta.nombre + "…");
@@ -2348,8 +2489,10 @@
       if (!needsEngineImmediate && reader) {
         try { openedFast = await openFastReaderForCurrent(resumePage); } catch (e) { openedFast = false; }
       }
+      if (mySeq !== S.openSeq) return;
       if (!openedFast) {
         const ok = await ensureInEngine("Abriendo " + meta.nombre + "…");
+        if (mySeq !== S.openSeq) return;
         if (!ok) throw new Error("No se pudo abrir el archivo.");
       }
 
@@ -2365,6 +2508,7 @@
       clearTimeout(S.thumbTimer);
       if (!meta.miniatura && !S.fastReader) S.thumbTimer = setTimeout(() => thumbnail(meta), 1100);
     } catch (e) {
+      if (mySeq !== S.openSeq) return;
       busy(false);
       toast(e.message || "No se pudo abrir el archivo.", 5000);
       S.doc = null;
@@ -2372,7 +2516,7 @@
       setFastReader(false);
       showHome();
     } finally {
-      S.opening = false;
+      if (mySeq === S.openSeq) S.opening = false;
     }
   }
 
@@ -2381,6 +2525,7 @@
     if (act === "liquid") setLiquidMode(!S.liquidMode);
     else if (act === "tts") toggleTts();
     else if (act === "organize") openPagesOverlay("organize");
+    else if (act === "split") openPagesOverlay("organize", { openSplit: true });
     else if (act === "pages") openPagesOverlay("view");
     else if (act === "copyRange") copyTextRangeSheet();
     else if (act === "exportMenu") exportMenuSheet();
@@ -2458,7 +2603,9 @@
   }
 
   let resizeTimer = null;
-  window.addEventListener("resize", () => {
+  let lastResizeW = window.innerWidth;
+  function handleViewportResize(isKeyboardOnly) {
+    if (isKeyboardOnly) return;
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(async () => {
       if (S.fastReader && reader && reader.isOpen()) { reader.resize(); return; }
@@ -2473,7 +2620,20 @@
           await pc.set("page", String(page));
         }
       } catch (e) {}
-    }, 280);
+    }, 260);
+  }
+  window.addEventListener("resize", () => {
+    const w = window.innerWidth;
+    const kb = body.classList.contains("pc-kb-open") && Math.abs(w - lastResizeW) < 4;
+    lastResizeW = w;
+    handleViewportResize(kb);
+  });
+  window.addEventListener("pc:viewport", (e) => {
+    const d = e && e.detail;
+    if (d && !d.keyboard && Math.abs(window.innerWidth - lastResizeW) >= 4) {
+      lastResizeW = window.innerWidth;
+      handleViewportResize(false);
+    }
   });
 
   async function closeAllEngineDocs() {
@@ -2537,6 +2697,7 @@
     if (window.pdfcraftSyncThemeColor) window.pdfcraftSyncThemeColor(true);
     renderBottom();
     syncWakeLock();
+    syncGesturesEnabled();
   }
 
   function updateNowIfIdle() {
@@ -2554,9 +2715,10 @@
     if (readerEl) readerEl.hidden = true;
     if (liquidEl) { liquidEl.hidden = true; liquidEl.replaceChildren(); }
     S.fastReader = false; S.liquidMode = false; S.immersive = false; S.modal = false; S.desktop = false;
-    S.mode = null; S.panel = null; S.searching = false; S.selectedAnnot = null;
+    S.mode = null; S.panel = null; S.searching = false; S.selectedAnnot = null; S.homeDialogActive = false;
     stopTts();
     syncWakeLock();
+    syncGesturesEnabled();
     if (updateNowIfIdle()) return;
     hideSelectionBar(); hideAnnotBar(); showModeHint("");
     await reloadLibrary();
@@ -2596,17 +2758,30 @@
   }
 
   // ---------- Modo Líquido (Lectura refluida + copia masiva multipágina) ----------
-  function setLiquidMode(on) {
+  let liquidScrollCleanup = null;
+  async function setLiquidMode(on) {
+    if (on && S.doc && reader && !reader.isOpen() && !S.doc.readerUnsupported) {
+      await returnToFastReader().catch(() => {});
+    }
     const want = !!(on && S.doc && reader && reader.isOpen());
+    if (on && !want) {
+      toast("Modo Líquido no disponible en este documento.");
+      return;
+    }
     if (S.liquidMode === want) return;
-    if (want && S.mode) exitMode(true);
+    if (want && S.mode) await exitMode(true);
     if (S.liquidIo) { S.liquidIo.disconnect(); S.liquidIo = null; }
+    if (liquidScrollCleanup) { liquidScrollCleanup(); liquidScrollCleanup = null; }
     S.liquidMode = want;
     if (!want) {
       if (liquidEl) { liquidEl.hidden = true; liquidEl.replaceChildren(); }
       if (readerEl) readerEl.hidden = !S.fastReader;
+      if (S.doc && S.fastReader && reader && reader.isOpen()) {
+        reader.goToPage(S.doc.page || 1, { instant: true });
+      }
       renderTop();
       if (S.doc) updatePageIndicator(S.doc.page, S.doc.pages);
+      syncGesturesEnabled();
       return;
     }
 
@@ -2615,6 +2790,15 @@
     if (readerEl) readerEl.hidden = true;
     liquidEl.hidden = false;
     liquidEl.style.setProperty("--pc-liquid-fs", (prefs.liquidFontSize || 18) + "px");
+    syncGesturesEnabled();
+
+    const startP = S.doc.page || 1;
+    const total = S.doc.pages || 1;
+    const pageBtn = h("button", {
+      type: "button", class: "pc-liquid-pbtn", "aria-label": "Ir a página",
+      text: `${startP}/${total}`,
+      onclick: () => goToPageSheet(),
+    });
 
     const bar = h("div", { class: "pc-liquid-bar" },
       h("button", { type: "button", text: "A−", "aria-label": "Reducir letra", onclick: () => {
@@ -2625,12 +2809,11 @@
         prefs.liquidFontSize = Math.min(30, (prefs.liquidFontSize || 18) + 2);
         savePrefs(); liquidEl.style.setProperty("--pc-liquid-fs", prefs.liquidFontSize + "px");
       } }),
+      pageBtn,
       h("button", { type: "button", icon: "copy", onclick: () => copyTextRangeSheet() }, h("span", { text: "Copiar" })),
       h("button", { type: "button", icon: "close", "aria-label": "Salir de Modo Líquido", onclick: () => setLiquidMode(false) }));
 
     const content = h("div", { class: "pc-liquid-content" });
-    const startP = S.doc.page || 1;
-    const total = S.doc.pages || 1;
 
     const loadPageEl = async (sec, pNum) => {
       if (sec.dataset.loaded) return;
@@ -2647,6 +2830,7 @@
       sec.replaceChildren(frag);
     };
 
+    const pageEls = [];
     S.liquidIo = new IntersectionObserver((entries) => {
       for (const entry of entries) {
         if (!entry.isIntersecting) continue;
@@ -2660,28 +2844,89 @@
         h("div", { class: "pc-liquid-pnum", text: "Página " + p + " de " + total }),
         h("p", { class: "pc-liquid-empty", text: "Cargando texto…" }));
       content.append(sec);
+      pageEls.push(sec);
       S.liquidIo.observe(sec);
     }
+
+    let liqScrollRaf = 0;
+    const onLiqScroll = () => {
+      if (liqScrollRaf || !S.liquidMode || !S.doc) return;
+      liqScrollRaf = requestAnimationFrame(() => {
+        liqScrollRaf = 0;
+        if (!S.liquidMode || !S.doc || !pageEls.length) return;
+        const lr = liquidEl.getBoundingClientRect();
+        const midY = lr.top + Math.min(180, lr.height * 0.35);
+        let lo = 0, hi = pageEls.length - 1, best = 0;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          const r = pageEls[mid].getBoundingClientRect();
+          if (r.top <= midY) { best = mid; lo = mid + 1; }
+          else hi = mid - 1;
+        }
+        const curPg = best + 1;
+        if (curPg !== S.doc.page) {
+          S.doc.page = curPg;
+          pageBtn.textContent = `${curPg}/${total}`;
+          saveLastPage();
+        }
+      });
+    };
+    liquidEl.addEventListener("scroll", onLiqScroll, { passive: true });
+    liquidScrollCleanup = () => {
+      if (liqScrollRaf) { cancelAnimationFrame(liqScrollRaf); liqScrollRaf = 0; }
+      liquidEl.removeEventListener("scroll", onLiqScroll);
+    };
 
     liquidEl.replaceChildren(bar, content);
     updatePageIndicator(startP, total);
     renderTop();
 
-    const targetEl = content.querySelector(`.pc-liquid-page[data-page="${startP}"]`);
+    const targetEl = pageEls[startP - 1];
     if (targetEl) {
       loadPageEl(targetEl, startP);
-      if (startP + 1 <= total) {
-        const nextEl = content.querySelector(`.pc-liquid-page[data-page="${startP + 1}"]`);
-        if (nextEl) loadPageEl(nextEl, startP + 1);
-      }
-      setTimeout(() => targetEl.scrollIntoView({ block: "start", behavior: "auto" }), 20);
+      if (startP + 1 <= total && pageEls[startP]) loadPageEl(pageEls[startP], startP + 1);
+      setTimeout(() => { if (targetEl.isConnected) targetEl.scrollIntoView({ block: "start", behavior: "auto" }); }, 20);
     }
     toast("Modo Líquido: selecciona y copia libremente entre páginas", 2600);
   }
 
-  // ---------- Leer en voz alta (Web Speech API) ----------
+  // ---------- Leer en voz alta (Web Speech API optimizado para Safari iOS) ----------
+  function splitTtsChunks(blocks) {
+    const out = [];
+    for (const b of blocks) {
+      const txt = String(b.text || "").replace(/\s+/g, " ").trim();
+      if (!txt) continue;
+      if (txt.length <= 220) { out.push(txt); continue; }
+      const parts = txt.match(/[^.!?¿¡;:\n]+[.!?¿¡;:\n]*\s*/g) || [txt];
+      let buf = "";
+      for (const p of parts) {
+        if ((buf + p).length > 220 && buf.trim()) {
+          out.push(buf.trim());
+          buf = p;
+        } else {
+          buf += p;
+        }
+      }
+      if (buf.trim()) out.push(buf.trim());
+    }
+    return out;
+  }
+
+  function detectTtsLang(text) {
+    if (S.ttsLang === "es") return "es-ES";
+    if (S.ttsLang === "en") return "en-US";
+    const sample = " " + String(text || "").toLowerCase() + " ";
+    if (/[áéíóúñü¿¡]/.test(sample)) return "es-ES";
+    const esHits = (sample.match(/\b(el|la|los|las|de|del|que|en|un|una|con|por|para|como|pero|sus|son|esta|este)\b/g) || []).length;
+    const enHits = (sample.match(/\b(the|and|of|to|in|is|that|for|with|are|this|from|have|was|were|not|by)\b/g) || []).length;
+    return enHits > esHits + 1 ? "en-US" : "es-ES";
+  }
+
+  let ttsSpeakTimer = null;
   function stopTts() {
-    S.ttsActive = false; S.ttsPaused = false; S.ttsBlocks = []; S.ttsIdx = 0;
+    S.ttsGen++;
+    clearTimeout(ttsSpeakTimer);
+    S.ttsActive = false; S.ttsPaused = false; S.ttsBlocks = []; S.ttsIdx = 0; S.ttsLabel = "";
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
     const bar = $("pc-tts-bar");
     if (bar) { bar.hidden = true; bar.replaceChildren(); }
@@ -2693,32 +2938,49 @@
     if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === "undefined") {
       toast("Leer en voz alta no está disponible en este navegador."); return;
     }
-    if (!S.doc || !reader || !reader.isOpen()) {
+    if (!S.doc) return;
+    if (!reader || !reader.isOpen()) {
       toast("Abre el documento en modo lectura para escucharlo."); return;
     }
+    // Desbloquear la sesión de audio de Safari iOS síncronamente dentro del gesto de toque
+    try {
+      window.speechSynthesis.cancel();
+      const prime = new SpeechSynthesisUtterance(" ");
+      prime.volume = 0;
+      prime.rate = 2;
+      window.speechSynthesis.speak(prime);
+    } catch (e) {}
+    S.ttsGen++;
     S.ttsActive = true;
     S.ttsPaused = false;
     S.ttsPage = S.doc.page || 1;
     renderTop();
     renderTtsBar("Preparando lectura…");
-    await startTtsPage(S.ttsPage);
+    await startTtsPage(S.ttsPage, false);
   }
 
-  async function startTtsPage(pg) {
+  async function startTtsPage(pg, startAtEnd) {
+    const myGen = S.ttsGen;
     if (!S.ttsActive || !reader || !reader.isOpen()) return;
     S.ttsPage = pg;
     const blocks = await reader.getPageBlocks(pg).catch(() => []);
-    if (!S.ttsActive) return;
-    S.ttsBlocks = blocks.map((b) => b.text).filter(Boolean);
-    S.ttsIdx = 0;
+    if (!S.ttsActive || myGen !== S.ttsGen) return;
+    S.ttsBlocks = splitTtsChunks(blocks);
+    S.ttsIdx = startAtEnd ? Math.max(0, S.ttsBlocks.length - 1) : 0;
     if (!S.ttsBlocks.length) {
-      if (pg < S.doc.pages) { startTtsPage(pg + 1); return; }
-      toast("No hay texto para leer en esta página.");
+      if (!startAtEnd && pg < S.doc.pages) { startTtsPage(pg + 1, false); return; }
+      if (startAtEnd && pg > 1) { startTtsPage(pg - 1, true); return; }
+      toast("No hay texto para leer en este documento.");
       stopTts();
       return;
     }
     if (pg !== S.doc.page) {
-      reader.goToPage(pg, { instant: true });
+      if (S.liquidMode) {
+        const el = liquidEl && liquidEl.querySelector(`.pc-liquid-page[data-page="${pg}"]`);
+        if (el) el.scrollIntoView({ block: "start", behavior: "smooth" });
+      } else {
+        reader.goToPage(pg, { instant: true });
+      }
       S.doc.page = pg;
     }
     speakCurrentBlock();
@@ -2726,27 +2988,40 @@
 
   function speakCurrentBlock() {
     if (!S.ttsActive || !window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
+    clearTimeout(ttsSpeakTimer);
+    const myGen = ++S.ttsGen;
+    try { window.speechSynthesis.cancel(); } catch (e) {}
     const txt = S.ttsBlocks[S.ttsIdx];
     if (!txt) {
-      if (S.ttsPage < (S.doc ? S.doc.pages : 1)) startTtsPage(S.ttsPage + 1);
+      if (S.ttsPage < (S.doc ? S.doc.pages : 1)) startTtsPage(S.ttsPage + 1, false);
       else stopTts();
       return;
     }
-    renderTtsBar(`Pág. ${S.ttsPage} · ${txt.slice(0, 60)}`);
-    const utt = new SpeechSynthesisUtterance(txt);
-    utt.lang = "es-ES";
-    utt.rate = prefs.ttsRate || 1.0;
-    const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
-    const esVoice = voices.find((v) => /^es/i.test(v.lang));
-    if (esVoice) utt.voice = esVoice;
-    utt.onend = () => {
-      if (!S.ttsActive || S.ttsPaused) return;
-      S.ttsIdx++;
-      speakCurrentBlock();
-    };
-    utt.onerror = () => {};
-    window.speechSynthesis.speak(utt);
+    S.ttsLabel = `Pág. ${S.ttsPage} · ${txt.slice(0, 64)}`;
+    renderTtsBar(S.ttsLabel);
+    ttsSpeakTimer = setTimeout(() => {
+      if (!S.ttsActive || S.ttsPaused || myGen !== S.ttsGen) return;
+      const utt = new SpeechSynthesisUtterance(txt);
+      const lang = detectTtsLang(txt);
+      utt.lang = lang;
+      utt.rate = prefs.ttsRate || 1.0;
+      const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+      const prefix = lang.slice(0, 2);
+      const matchVoice = voices.find((v) => v.lang && v.lang.toLowerCase().startsWith(prefix));
+      if (matchVoice) utt.voice = matchVoice;
+      utt.onend = () => {
+        if (!S.ttsActive || S.ttsPaused || myGen !== S.ttsGen) return;
+        S.ttsIdx++;
+        speakCurrentBlock();
+      };
+      utt.onerror = (ev) => {
+        if (!S.ttsActive || S.ttsPaused || myGen !== S.ttsGen) return;
+        if (ev && (ev.error === "canceled" || ev.error === "interrupted")) return;
+        S.ttsIdx++;
+        speakCurrentBlock();
+      };
+      try { window.speechSynthesis.speak(utt); } catch (e) {}
+    }, 45);
   }
 
   function renderTtsBar(label) {
@@ -2754,29 +3029,45 @@
     if (!bar) return;
     if (!S.ttsActive) { bar.hidden = true; return; }
     bar.hidden = false;
+    if (label) S.ttsLabel = label;
     const rates = [0.8, 1.0, 1.25, 1.5, 2.0];
+    const langs = ["auto", "es", "en"];
+    const langText = S.ttsLang === "es" ? "ES" : S.ttsLang === "en" ? "EN" : "Auto";
     bar.replaceChildren(
-      h("button", { class: "pc-tts-btn", type: "button", "aria-label": "Anterior", icon: "back", onclick: () => { S.ttsIdx = Math.max(0, S.ttsIdx - 1); S.ttsPaused = false; speakCurrentBlock(); } }),
+      h("button", { class: "pc-tts-btn", type: "button", "aria-label": "Anterior", icon: "back", onclick: () => {
+        S.ttsPaused = false;
+        if (S.ttsIdx > 0) { S.ttsIdx--; speakCurrentBlock(); }
+        else if (S.ttsPage > 1) startTtsPage(S.ttsPage - 1, true);
+        else speakCurrentBlock();
+      } }),
       h("button", {
         class: "pc-tts-btn pc-primary-mini", type: "button", "aria-label": S.ttsPaused ? "Reanudar" : "Pausar",
         icon: S.ttsPaused ? "play" : "pause",
         onclick: () => {
           S.ttsPaused = !S.ttsPaused;
-          if (S.ttsPaused) window.speechSynthesis.cancel();
+          if (S.ttsPaused) { S.ttsGen++; clearTimeout(ttsSpeakTimer); window.speechSynthesis.cancel(); }
           else speakCurrentBlock();
-          renderTtsBar(label);
+          renderTtsBar();
         },
       }),
       h("button", { class: "pc-tts-btn", type: "button", "aria-label": "Siguiente", icon: "chevRight", onclick: () => { S.ttsIdx++; S.ttsPaused = false; speakCurrentBlock(); } }),
-      h("span", { text: label || ("Leyendo pág. " + S.ttsPage) }),
+      h("span", { text: S.ttsLabel || ("Leyendo pág. " + S.ttsPage) }),
       h("button", {
-        class: "pc-tts-btn", type: "button", text: (prefs.ttsRate || 1) + "×",
+        class: "pc-tts-btn", type: "button", "aria-label": "Idioma de lectura", text: langText,
+        onclick: () => {
+          S.ttsLang = langs[(langs.indexOf(S.ttsLang) + 1) % langs.length];
+          if (!S.ttsPaused) speakCurrentBlock();
+          else renderTtsBar();
+        },
+      }),
+      h("button", {
+        class: "pc-tts-btn", type: "button", "aria-label": "Velocidad", text: (prefs.ttsRate || 1) + "×",
         onclick: () => {
           const i = rates.indexOf(prefs.ttsRate || 1);
           prefs.ttsRate = rates[(i + 1) % rates.length];
           savePrefs();
           if (!S.ttsPaused) speakCurrentBlock();
-          else renderTtsBar(label);
+          else renderTtsBar();
         },
       }),
       h("button", { class: "pc-tts-btn", type: "button", "aria-label": "Detener", icon: "close", onclick: stopTts })
@@ -2844,14 +3135,14 @@
   }
 
   // ---------- Vista nativa móvil de Páginas y Organizar páginas (pdf-lib + PDF.js) ----------
-  async function openPagesOverlay(initialMode) {
+  async function openPagesOverlay(initialMode, extraOpts) {
     if (!S.doc || !window.pdfcraftOrganizer) return;
     document.querySelectorAll(".pc-sheet-wrap").forEach((w) => w.remove());
     setImmersive(false);
     hideSelectionBar(); hideAnnotBar();
     if (S.mode) await exitMode(true);
     if (S.searching) closeSearch();
-    if (S.liquidMode) setLiquidMode(false);
+    if (S.liquidMode) await setLiquidMode(false);
     stopTts();
 
     // Si había cambios sin guardar en el motor WASM, guárdalos antes de organizar
@@ -2870,10 +3161,12 @@
       pageCount: S.doc.pages || 1,
       currentPage: S.doc.page || 1,
       mode: initialMode || "view",
+      openSplit: !!(extraOpts && extraOpts.openSplit),
       reader,
       toast,
       sheet,
       list,
+      onClose: () => syncGesturesEnabled(),
       onJumpPage: (pg) => {
         if (S.fastReader && reader && reader.isOpen()) reader.goToPage(pg, { recordHistory: true, instant: true });
         else pc.set("page", String(pg)).catch(() => {});
@@ -2937,6 +3230,7 @@
         runCommand("page.split", "Organizar");
       },
     });
+    syncGesturesEnabled();
   }
 
   // ---------- Barra superior del visor (exacto a Capturas 12, 14, 15, 19) ----------
@@ -2959,17 +3253,35 @@
       const find = async () => {
         S.searchQuery = input.value;
         const q = input.value.trim();
+        S.lastSearchedQuery = q;
         if (S.fastReader && reader && reader.isOpen()) {
           if (!q) { reader.clearSearch(); S.findLabel = ""; renderBottom(); return; }
           S.findLabel = "Buscando…"; renderBottom();
-          const res = await reader.search(q).catch(() => null);
+          const res = await reader.search(q, (doneP, totP, found) => {
+            if (S.searching && S.lastSearchedQuery === q) {
+              S.findLabel = `Buscando… pág. ${doneP}/${totP}` + (found ? ` (${found})` : "");
+              renderBottom();
+            }
+          }).catch(() => null);
           if (res && S.searching) { S.findLabel = res.label; renderBottom(); }
           return;
         }
         if (q) pc.set("find", q).catch(() => {});
       };
       input.addEventListener("input", () => { clearBtn.hidden = !input.value; clearTimeout(timer); timer = setTimeout(find, 220); });
-      input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); clearTimeout(timer); input.blur(); find(); } });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          clearTimeout(timer);
+          const q = input.value.trim();
+          if (q && q === S.lastSearchedQuery && S.findLabel && /^\d+\s+de\s+\d+/.test(S.findLabel)) {
+            findStep(true);
+            return;
+          }
+          input.blur();
+          find();
+        }
+      });
       top.replaceChildren(
         h("label", { class: "pc-search" }, h("span", { icon: "search" }), input, clearBtn),
         h("button", { class: "pc-text-btn pc-accent", type: "button", text: "Cancelar", onclick: () => closeSearch() }));
@@ -3135,7 +3447,12 @@
     const outlineWrap = h("div");
 
     const jumpTo = (pg, close) => {
-      if (S.fastReader && reader && reader.isOpen()) reader.goToPage(pg, { recordHistory: true, instant: true });
+      if (S.liquidMode && liquidEl) {
+        const sec = liquidEl.querySelector(`.pc-liquid-page[data-page="${pg}"]`);
+        if (sec) sec.scrollIntoView({ block: "start", behavior: "auto" });
+        const pb = liquidEl.querySelector(".pc-liquid-pbtn");
+        if (pb && S.doc) pb.textContent = `${pg}/${S.doc.pages}`;
+      } else if (S.fastReader && reader && reader.isOpen()) reader.goToPage(pg, { recordHistory: true, instant: true });
       else pc.set("page", String(pg)).catch(() => {});
       if (S.doc) { S.doc.page = pg; updatePageIndicator(pg, S.doc.pages); saveLastPage(); }
       close();
@@ -3192,12 +3509,29 @@
     if (reader && reader.isOpen()) {
       reader.getOutline().then((items) => {
         if (!items || !items.length || !outlineWrap.isConnected) return;
-        outlineWrap.replaceChildren(
-          h("div", { class: "pc-label", text: "Índice del documento" }),
-          h("div", { class: "pc-list" }, items.slice(0, 100).map((it) => h("div", { class: "pc-bm-item", style: it.depth ? ("padding-left:" + (14 + it.depth * 14) + "px") : null },
+        const capped = items.slice(0, 600);
+        const listBox = h("div", { class: "pc-list" });
+        const paint = (filter) => {
+          const q = String(filter || "").trim().toLowerCase();
+          const filtered = q ? capped.filter((it) => it.title.toLowerCase().includes(q)) : capped;
+          if (!filtered.length) {
+            listBox.replaceChildren(h("p", { style: "padding:12px 14px;margin:0;color:var(--muted);font-size:13.5px", text: "Sin coincidencias en el índice." }));
+            return;
+          }
+          listBox.replaceChildren(...filtered.map((it) => h("div", { class: "pc-bm-item", style: it.depth ? ("padding-left:" + (14 + Math.min(4, it.depth) * 14) + "px") : null },
             h("button", { class: "pc-bm-go", type: "button", onclick: () => jumpTo(it.page, close) },
               h("span", { class: "pc-bm-page", text: "P. " + it.page }),
-              h("span", { class: "pc-bm-title", text: it.title }))))));
+              h("span", { class: "pc-bm-title", text: it.title })))));
+        };
+        const nodes = [h("div", { class: "pc-label", text: `Índice del documento (${items.length})` })];
+        if (capped.length > 12) {
+          const filterIn = h("input", { class: "pc-field", type: "search", placeholder: "Filtrar capítulos o secciones…", "aria-label": "Filtrar índice" });
+          filterIn.addEventListener("input", () => paint(filterIn.value));
+          nodes.push(filterIn);
+        }
+        nodes.push(listBox);
+        paint("");
+        outlineWrap.replaceChildren(...nodes);
       }).catch(() => {});
     }
   }
@@ -3392,15 +3726,23 @@
   }
 
   async function runCommand(id, label) {
+    const fromHome = !S.doc && !body.classList.contains("pc-in-viewer");
     try {
       if (S.doc && S.fastReader) {
         const ok = await ensureInEngine("Preparando " + (label || "herramienta") + "…");
         if (!ok) return;
       } else {
-        await ensureEngineReady();
+        if (fromHome) {
+          S.homeDialogActive = true;
+          showViewer();
+        }
+        await ensureEngineReady("Preparando " + (label || "herramienta") + "…");
+        busy(false);
       }
       await pc.run(id);
     } catch (e) {
+      busy(false);
+      if (fromHome && !S.doc) { S.homeDialogActive = false; showHome(); }
       const msg = String(e.message || e);
       if (/disabled|not enabled|no selection|unavailable/i.test(msg)) toast((label || "Esa acción") + " no está disponible ahora.");
       else toast("No se pudo: " + msg, 4000);
@@ -3417,15 +3759,19 @@
     if (rawWriteText) {
       try { await rawWriteText(clean); return true; } catch (e) {}
     }
-    // Respaldo síncrono execCommand("copy") con textarea temporal
+    // Respaldo síncrono execCommand("copy") compatible con iOS Safari (Range + contentEditable)
     try {
       const ta = document.createElement("textarea");
       ta.value = clean;
-      ta.setAttribute("readonly", "");
-      ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+      ta.contentEditable = "true";
+      ta.readOnly = false;
+      ta.style.cssText = "position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;font-size:16px;";
       document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
+      ta.focus({ preventScroll: true });
+      const range = document.createRange();
+      range.selectNodeContents(ta);
+      const sel = window.getSelection();
+      if (sel) { sel.removeAllRanges(); sel.addRange(range); }
       ta.setSelectionRange(0, clean.length);
       const ok = document.execCommand("copy");
       ta.remove();
@@ -3454,7 +3800,6 @@
   function hideSelectionBar() { if (selBar) { selBar.remove(); selBar = null; } }
   function showSelectionBar() {
     hideSelectionBar(); hideAnnotBar();
-    const keepSel = (e) => { e.preventDefault(); };
     const mark = async (cmd, qTool, label) => {
       hideSelectionBar();
       if (S.fastReader && reader) {
@@ -3466,13 +3811,48 @@
       runCommand(cmd, label);
     };
     const mkBtn = (ic, label, fn) => {
-      const b = h("button", { type: "button", icon: ic, onclick: fn }, h("span", { text: label }));
-      // Evita que tocar Copiar colapse la selección de Safari iOS antes de leerla
-      b.addEventListener("pointerdown", keepSel);
-      b.addEventListener("touchstart", keepSel, { passive: false });
+      let lastTouchFire = 0;
+      let tStart = null;
+      const b = h("button", {
+        type: "button", icon: ic,
+        onclick: () => {
+          if (Date.now() - lastTouchFire < 500) return;
+          fn();
+        },
+      }, h("span", { text: label }));
+      // En mouse/iPad pointerdown evita colapsar la selección; en iPhone táctil disparamos en touchend
+      // (preventDefault en touchstart suprimiría onclick en Safari iOS).
+      b.addEventListener("pointerdown", (e) => { if (e.pointerType !== "touch") e.preventDefault(); });
+      b.addEventListener("touchstart", (e) => {
+        if (e.touches && e.touches.length === 1) {
+          tStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        }
+        if (e.cancelable) e.preventDefault();
+      }, { passive: false });
+      b.addEventListener("touchend", (e) => {
+        if (!tStart) return;
+        const pt = e.changedTouches && e.changedTouches[0];
+        const moved = pt ? Math.hypot(pt.clientX - tStart.x, pt.clientY - tStart.y) > 12 : false;
+        tStart = null;
+        if (!moved) {
+          if (e.cancelable) e.preventDefault();
+          lastTouchFire = Date.now();
+          fn();
+        }
+      }, { passive: false });
       return b;
     };
-    selBar = h("div", { class: "pc-selbar", role: "toolbar", "aria-label": "Texto seleccionado" },
+    let placeBottom = false;
+    try {
+      const sel = window.getSelection();
+      const docEl = $("pc-doc");
+      if (sel && !sel.isCollapsed && sel.rangeCount && docEl) {
+        const sr = sel.getRangeAt(0).getBoundingClientRect();
+        const dr = docEl.getBoundingClientRect();
+        if (sr.height > 0 && (sr.top - dr.top) < 110) placeBottom = true;
+      }
+    } catch (e) {}
+    selBar = h("div", { class: "pc-selbar" + (placeBottom ? " pc-selbar-bottom" : ""), role: "toolbar", "aria-label": "Texto seleccionado" },
       mkBtn("copy", "Copiar", copySelection),
       mkBtn("fileLines", "Pág.", () => { hideSelectionBar(); copyTextRangeSheet(); }),
       mkBtn("highlight", "Resaltar", () => mark("comment.highlight", "highlight", "Resaltar")),
@@ -3606,9 +3986,12 @@
       close();
     };
 
+    const switches = [];
+    const syncSwitches = () => switches.forEach(({ sw, get }) => sw.setAttribute("aria-checked", String(get())));
     const makeToggle = (ic, label, get, onToggle) => {
       const sw = h("button", { class: "pc-switch", type: "button", role: "switch", "aria-checked": String(get()), "aria-label": label });
-      sw.addEventListener("click", () => { onToggle(!get()); sw.setAttribute("aria-checked", String(get())); });
+      switches.push({ sw, get });
+      sw.addEventListener("click", () => { onToggle(!get()); syncSwitches(); });
       return h("div", { class: "pc-toggle-row" },
         h("div", { class: "pc-toggle-row-left" }, h("span", { icon: ic }), h("span", { text: label })),
         sw);
@@ -3632,6 +4015,11 @@
         h("div", { class: "pc-list" },
           makeToggle("moon", "Modo nocturno", () => prefs.lectura === "noche", (v) => { prefs.lectura = v ? "noche" : "normal"; savePrefs(); applyReadingVisuals(); }),
           makeToggle("sun", "Tono sepia", () => prefs.lectura === "sepia", (v) => { prefs.lectura = v ? "sepia" : "normal"; savePrefs(); applyReadingVisuals(); }),
+          makeToggle("layout", "Espacio entre páginas", () => !!S.readerPageGaps, (v) => {
+            S.readerPageGaps = v;
+            if (S.fastReader && reader && reader.isOpen()) reader.setPageGaps(v);
+            else if (S.ready) pc.set("page-gaps", v ? "on" : "off").catch(() => {});
+          }),
           makeToggle("iphone", "Mantener pantalla encendida", () => !!prefs.pantallaActiva, (v) => { prefs.pantallaActiva = v; savePrefs(); syncWakeLock(); })),
         h("div", { class: "pc-label", text: "Brillo y ajuste" }),
         h("div", { class: "pc-list" },
@@ -3655,7 +4043,12 @@
     });
     const jump = (n, close) => {
       const target = Math.max(1, Math.min(total, n));
-      if (S.fastReader && reader && reader.isOpen()) reader.goToPage(target, { recordHistory: true, instant: true });
+      if (S.liquidMode && liquidEl) {
+        const sec = liquidEl.querySelector(`.pc-liquid-page[data-page="${target}"]`);
+        if (sec) sec.scrollIntoView({ block: "start", behavior: "auto" });
+        const pb = liquidEl.querySelector(".pc-liquid-pbtn");
+        if (pb) pb.textContent = `${target}/${total}`;
+      } else if (S.fastReader && reader && reader.isOpen()) reader.goToPage(target, { recordHistory: true, instant: true });
       else pc.set("page", String(target)).catch(() => {});
       if (S.doc) { S.doc.page = target; updatePageIndicator(target, total); saveLastPage(); }
       close();
@@ -3775,7 +4168,7 @@
           { i: "refresh", t: "Buscar actualizaciones", run: () => { close(); if (window.pdfcraftCheckUpdate) window.pdfcraftCheckUpdate(); } },
           { i: "desktop", t: "Interfaz completa (PC)", small: "Escritorio", run: () => { close(); setDesktop(true); } },
         ]),
-        h("p", { text: "PdfCraft para iPhone v3.1 · Lector PDF.js con streaming por rangos (libros de 400+ MB), TextLayer oficial iOS, Organizar nativo pdf-lib y Editor PdfCraft. 100 % local." + (S.appVersion ? " Motor " + S.appVersion + "." : "") }),
+        h("p", { text: "PdfCraft para iPhone v3.2 · Lector PDF.js con streaming por rangos (libros de 400+ MB), TextLayer oficial iOS, Organizar nativo pdf-lib y Editor PdfCraft bajo demanda. 100 % local." + (S.appVersion ? " Motor " + S.appVersion + "." : "") }),
       ],
     });
   }
@@ -3849,7 +4242,49 @@
       h("div", { class: "pc-sheet-head-txt" }, h("h3", { text: title }), text ? h("small", { text }) : null),
       starBtn || h("button", { class: "pc-icon-btn", type: "button", "aria-label": "Cerrar", icon: "close", onclick: close }));
 
-    const panel = h("div", { class: "pc-sheet" }, h("div", { class: "pc-grabber" }), headRow, build(close));
+    const grabber = h("div", { class: "pc-grabber" });
+    const panel = h("div", { class: "pc-sheet" }, grabber, headRow, build(close));
+    // Deslizar hacia abajo desde el borde superior o cabecera para cerrar la hoja (gesto nativo iOS)
+    let drag = null;
+    panel.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+      const inHead = !!(e.target && e.target.closest && e.target.closest(".pc-grabber, .pc-sheet-head"));
+      if (!inHead && panel.scrollTop > 2) return;
+      if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+      drag = { y0: e.touches[0].clientY, t0: performance.now(), dy: 0, active: false, inHead };
+    }, { passive: true });
+    panel.addEventListener("touchmove", (e) => {
+      if (!drag || e.touches.length !== 1) return;
+      const dy = e.touches[0].clientY - drag.y0;
+      if (!drag.active) {
+        if (dy > 10 && (drag.inHead || panel.scrollTop <= 0)) drag.active = true;
+        else if (dy < -8) { drag = null; return; }
+      }
+      if (drag.active && dy > 0) {
+        if (e.cancelable) e.preventDefault();
+        drag.dy = dy;
+        panel.style.transition = "none";
+        panel.style.transform = `translate3d(0,${dy.toFixed(0)}px,0)`;
+      }
+    }, { passive: false });
+    const endDrag = () => {
+      if (!drag) return;
+      const d = drag; drag = null;
+      if (!d.active) return;
+      const vel = d.dy / Math.max(16, performance.now() - d.t0);
+      if (d.dy > 90 || vel > 0.55) {
+        panel.style.transition = "transform 160ms ease";
+        panel.style.transform = "translate3d(0,100%,0)";
+        setTimeout(close, 150);
+      } else {
+        panel.style.transition = "transform 180ms cubic-bezier(.32,.72,0,1)";
+        panel.style.transform = "";
+        setTimeout(() => { panel.style.transition = ""; }, 190);
+      }
+    };
+    panel.addEventListener("touchend", endDrag, { passive: true });
+    panel.addEventListener("touchcancel", endDrag, { passive: true });
+
     wrap.append(h("div", { class: "pc-scrim", onclick: close }), panel);
     document.body.append(wrap);
     document.addEventListener("keydown", onKey);

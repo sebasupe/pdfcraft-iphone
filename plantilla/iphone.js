@@ -53,6 +53,7 @@
       var isDark = themeAttr === "dark" ||
         (themeAttr !== "light" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
       var color = inViewer ? (isDark ? "#1a1a1c" : "#fafafc") : (isDark ? "#141414" : "#f4f4f6");
+      html.style.backgroundColor = color;
       var metas = document.querySelectorAll('meta[name="theme-color"]');
       if (!metas.length) {
         var m = document.createElement("meta");
@@ -60,10 +61,9 @@
         m.content = color;
         document.head.appendChild(m);
       } else {
-        metas.forEach(function (m) {
-          m.removeAttribute("media");
-          m.setAttribute("content", color);
-        });
+        metas[0].removeAttribute("media");
+        metas[0].setAttribute("content", color);
+        for (var i = 1; i < metas.length; i++) metas[i].remove();
       }
     } catch (e) {}
   };
@@ -76,9 +76,13 @@
     var lastH = 0;
     function sync() {
       raf = 0;
+      var zoomed = (vv.scale || 1) > 1.02;
+      if (zoomed) return;
       var h = Math.round(vv.height);
       var top = Math.max(0, Math.round(vv.offsetTop));
-      var kbOpen = window.innerHeight - h > 120;
+      var active = document.activeElement;
+      var editing = !!(active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable));
+      var kbOpen = (window.innerHeight - h > 120) || (editing && window.innerHeight - h > 70);
       document.documentElement.style.setProperty("--pc-vh", h + "px");
       document.documentElement.style.setProperty("--pc-vtop", top + "px");
       document.body.classList.toggle("pc-kb-open", kbOpen);
@@ -180,26 +184,37 @@
     });
   }
 
+  window.pdfcraftWaitFirstInstall = async function () {
+    if (!sw || sw.controller) return;
+    setStatus("Instalando PdfCraft en este iPhone…");
+    try {
+      await waitForInstall(10 * 60 * 1000);
+    } catch (e) {
+      console.warn("PdfCraft: sin instalación offline (" + e.message + "), se abre directo");
+    }
+  };
+
   window.pdfcraftFetchWasm = async function (url, expectedBytes) {
     if (sw && !sw.controller) {
-      setStatus("Instalando PdfCraft en este iPhone…");
-      try {
-        await waitForInstall(10 * 60 * 1000);
-      } catch (e) {
-        console.warn("PdfCraft: sin instalación offline (" + e.message + "), se abre directo");
-      }
+      await window.pdfcraftWaitFirstInstall();
     }
-    setStatus("Abriendo PdfCraft…");
+    var busyTxt = document.getElementById("pc-busy-text");
+    var setMsg = function (t) {
+      setStatus(t);
+      if (busyTxt && busyTxt.parentElement && !busyTxt.parentElement.hidden) busyTxt.textContent = t;
+    };
+    setMsg("Cargando editor PdfCraft…");
     var response;
     try {
       response = await fetch(url);
     } catch (e) {
-      throw new Error("No se pudo descargar la app.\n" + SIN_RED);
+      throw new Error("No se pudo descargar el editor.\n" + SIN_RED);
     }
-    if (!response.ok) throw new Error("No se pudo descargar la app (" + response.status + ").\n" + SIN_RED);
+    if (!response.ok) throw new Error("No se pudo descargar el editor (" + response.status + ").\n" + SIN_RED);
     if (!response.body || typeof ReadableStream !== "function") return response;
     var total = expectedBytes || Number(response.headers.get("Content-Length")) || 0;
     var loaded = 0;
+    var lastPct = -1;
     var reader = response.body.getReader();
     setProgress(0);
     var stream = new ReadableStream({
@@ -207,12 +222,20 @@
         var chunk = await reader.read();
         if (chunk.done) {
           setProgress(1);
-          setStatus("Preparando…");
+          setMsg("Iniciando editor…");
           controller.close();
           return;
         }
         loaded += chunk.value.byteLength;
-        if (total) setProgress(loaded / total);
+        if (total) {
+          var frac = loaded / total;
+          setProgress(frac);
+          var pct = Math.min(100, Math.round(frac * 100));
+          if (pct !== lastPct && pct % 10 === 0) {
+            lastPct = pct;
+            setMsg("Cargando editor… " + pct + "%");
+          }
+        }
         controller.enqueue(chunk.value);
       },
       cancel(reason) { return reader.cancel(reason); }
@@ -248,13 +271,13 @@
     var url = createURL(obj);
     if (obj instanceof Blob) {
       blobs.set(url, obj);
-      if (blobs.size > 24) blobs.delete(blobs.keys().next().value);
+      if (blobs.size > 8) blobs.delete(blobs.keys().next().value);
     }
     return url;
   };
   URL.revokeObjectURL = function (url) {
     revokeURL(url);
-    setTimeout(function () { blobs.delete(url); }, 60000);
+    setTimeout(function () { blobs.delete(url); }, 15000);
   };
   function download(blob, name) {
     var a = document.createElement("a");
@@ -263,7 +286,7 @@
     document.body.appendChild(a);
     anchorClick.call(a);
     a.remove();
-    setTimeout(function () { revokeURL(a.href); }, 60000);
+    setTimeout(function () { revokeURL(a.href); }, 20000);
   }
   window.pdfcraftShareFile = async function (file) {
     if (!(isIOS && navigator.share && navigator.canShare)) { download(file, file.name); return true; }
@@ -283,6 +306,7 @@
   HTMLAnchorElement.prototype.click = function () {
     var blob = this.download ? blobs.get(this.href) : null;
     if (!blob) return anchorClick.call(this);
+    blobs.delete(this.href);
     var name = this.download;
     var ext = (name.split(".").pop() || "").toLowerCase();
     var file = new File([blob], name, { type: blob.type || types[ext] || "application/octet-stream" });

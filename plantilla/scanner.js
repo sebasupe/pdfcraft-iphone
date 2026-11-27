@@ -7,14 +7,16 @@
 
   function loadImage(file) {
     return new Promise((resolve, reject) => {
-      const url = URL.createObjectURL(file);
+      const mkUrl = window.__pcRawCreateObjectURL || URL.createObjectURL.bind(URL);
+      const rmUrl = window.__pcRawRevokeObjectURL || URL.revokeObjectURL.bind(URL);
+      const url = mkUrl(file);
       const img = new Image();
       img.onload = () => {
-        URL.revokeObjectURL(url);
+        rmUrl(url);
         resolve(img);
       };
       img.onerror = () => {
-        URL.revokeObjectURL(url);
+        rmUrl(url);
         reject(new Error("No se pudo leer la imagen " + (file.name || "")));
       };
       img.src = url;
@@ -129,15 +131,39 @@
     return { pw, ph, x: 0, y: 0, dw: pw, dh: ph };
   }
 
+  function canvasToJpegBytes(canvas, quality) {
+    return new Promise((resolve) => {
+      if (canvas.toBlob) {
+        canvas.toBlob((blob) => {
+          if (blob) {
+            blob.arrayBuffer().then((buf) => resolve(new Uint8Array(buf))).catch(() => {
+              resolve(dataUrlToBytes(canvas.toDataURL("image/jpeg", quality)));
+            });
+          } else {
+            resolve(dataUrlToBytes(canvas.toDataURL("image/jpeg", quality)));
+          }
+        }, "image/jpeg", quality);
+      } else {
+        resolve(dataUrlToBytes(canvas.toDataURL("image/jpeg", quality)));
+      }
+    });
+  }
+
   async function buildPdf(items, opts) {
     const paper = (opts && opts.paper) || "auto";
     const quality = (opts && opts.quality) || 0.86;
+    const onProgress = opts && opts.onProgress;
     const name = ((opts && opts.name) || "Escaneo.pdf").replace(/\.pdf$/i, "") + ".pdf";
     const prepared = [];
-    for (const item of items) {
+    for (let idx = 0; idx < items.length; idx++) {
+      const item = items[idx];
+      if (onProgress) onProgress(idx + 1, items.length);
       const canvas = renderToCanvas(item.img, item.rot || 0, item.filter || "original", MAX_SIDE);
-      const jpeg = dataUrlToBytes(canvas.toDataURL("image/jpeg", quality));
-      prepared.push({ w: canvas.width, h: canvas.height, jpeg });
+      const w = canvas.width, h = canvas.height;
+      const jpeg = await canvasToJpegBytes(canvas, quality);
+      canvas.width = 0; canvas.height = 0;
+      prepared.push({ w, h, jpeg });
+      if (idx + 1 < items.length) await new Promise((r) => setTimeout(r, 0));
     }
     if (!prepared.length) throw new Error("No hay imágenes para convertir.");
 
@@ -194,8 +220,11 @@
   }
 
   function makeThumb(img, rot, filter) {
-    return renderToCanvas(img, rot || 0, filter || "original", 180).toDataURL("image/jpeg", 0.72);
+    const c = renderToCanvas(img, rot || 0, filter || "original", 180);
+    const url = c.toDataURL("image/jpeg", 0.72);
+    c.width = 0; c.height = 0;
+    return url;
   }
 
-  window.pdfcraftScanner = { loadImage, makeThumb, buildPdf };
+  window.pdfcraftScanner = { loadImage, makeThumb, buildPdf, canvasToJpegBytes };
 })();

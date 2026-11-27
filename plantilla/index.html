@@ -34,8 +34,9 @@
       (function () {
         try {
           var raw = JSON.parse(localStorage.getItem("pdfcraft-movil") || "{}");
-          if (raw.tema === "oscuro") document.documentElement.setAttribute("data-theme", "dark");
-          else if (raw.tema === "claro") document.documentElement.setAttribute("data-theme", "light");
+          var tema = raw.tema || "oscuro";
+          if (tema === "oscuro") document.documentElement.setAttribute("data-theme", "dark");
+          else if (tema === "claro") document.documentElement.setAttribute("data-theme", "light");
           var calidad = raw.calidad || "fluida";
           var realDpr = window.devicePixelRatio || 1;
           window.__pdfcraftNativeDpr = realDpr;
@@ -176,11 +177,24 @@
     <script src="./organizar.js"></script>
     <script src="./movil.js"></script>
     <script type="module">
-      import init, * as bindings from "./__GLUE__";
-      const wasmResponse = await window.pdfcraftFetchWasm("./__WASM__", __WASM_BYTES__);
-      const wasm = await init({ module_or_path: wasmResponse });
-      window.wasmBindings = bindings;
-      dispatchEvent(new CustomEvent("TrunkApplicationStarted", { detail: { wasm } }));
+      // Carga bajo demanda del motor de edición Rust/WASM (~69 MB): ahorra ~200 MB de RAM en iPhone durante la lectura.
+      let bootPromise = null;
+      window.pdfcraftBootEngine = function () {
+        if (!bootPromise) {
+          bootPromise = (async () => {
+            const mod = await import("./__GLUE__");
+            const wasmResponse = await window.pdfcraftFetchWasm("./__WASM__", __WASM_BYTES__);
+            const wasm = await mod.default({ module_or_path: wasmResponse });
+            window.wasmBindings = mod;
+            dispatchEvent(new CustomEvent("TrunkApplicationStarted", { detail: { wasm } }));
+            return wasm;
+          })().catch((err) => {
+            bootPromise = null;
+            throw err;
+          });
+        }
+        return bootPromise;
+      };
     </script>
   </body>
 </html>

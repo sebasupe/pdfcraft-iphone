@@ -285,6 +285,7 @@
       const stopped = stopFling(true);
       if (opts.onTouchStart) opts.onTouchStart(stopped);
       if (mine.length >= 2) {
+        if (g && g.kind === "pinch") return;
         clearTimeout(singleTapTimer);
         if (g && g.timer) clearTimeout(g.timer);
         if (g && (g.kind === "drag" || g.kind === "press")) fire.up(g.x, g.y);
@@ -456,7 +457,7 @@
         fire.move(x, y, 1);
         fire.up(x, y);
         fire.leave();
-        if (was.kind === "press" && opts.onSelectEnd) opts.onSelectEnd(x, y, Math.hypot(x - was.x0, y - was.y0) >= SLOP);
+        if (!cancelled && was.kind === "press" && opts.onSelectEnd) opts.onSelectEnd(x, y, Math.hypot(x - was.x0, y - was.y0) >= SLOP);
       }
     }
 
@@ -468,15 +469,44 @@
     }
 
     const active = { passive: false, capture: true };
-    window.addEventListener("touchstart", onStart, active);
-    window.addEventListener("touchmove", onMove, active);
-    window.addEventListener("touchend", onEnd, active);
-    window.addEventListener("touchcancel", onEnd, active);
-    for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel", "gesturestart", "gesturechange", "gestureend"]) {
-      window.addEventListener(type, block, active);
+    const blockTypes = ["pointerdown", "pointermove", "pointerup", "pointercancel", "gesturestart", "gesturechange", "gestureend"];
+    let enabled = false;
+
+    function stop() {
+      if (g && g.timer) clearTimeout(g.timer);
+      g = null;
+      stopFling(true);
+      clearPinchTransform();
+      flushPanNow();
+      clearTimeout(singleTapTimer);
+      clearTimeout(zoomLeaveTimer);
+      endScroll();
+      fire.leave();
     }
+
+    function setEnabled(on) {
+      const want = !!on;
+      if (enabled === want) return;
+      enabled = want;
+      if (want) {
+        window.addEventListener("touchstart", onStart, active);
+        window.addEventListener("touchmove", onMove, active);
+        window.addEventListener("touchend", onEnd, active);
+        window.addEventListener("touchcancel", onEnd, active);
+        for (const type of blockTypes) window.addEventListener(type, block, active);
+      } else {
+        stop();
+        window.removeEventListener("touchstart", onStart, active);
+        window.removeEventListener("touchmove", onMove, active);
+        window.removeEventListener("touchend", onEnd, active);
+        window.removeEventListener("touchcancel", onEnd, active);
+        for (const type of blockTypes) window.removeEventListener(type, block, active);
+      }
+    }
+
     return {
-      stop: () => { stopFling(); clearPinchTransform(); flushPanNow(); clearTimeout(singleTapTimer); clearTimeout(zoomLeaveTimer); fire.leave(); },
+      stop,
+      setEnabled,
       busy: () => !!(g || fling || pinchTransformActive || pinchClearRaf),
       typing,
       zoomBy,
