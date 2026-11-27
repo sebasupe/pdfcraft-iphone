@@ -1,23 +1,28 @@
-// PdfCraft para iPhone: lector PDF ultrarrápido de nivel nativo iOS impulsado por Mozilla PDF.js
+// PdfCraft para iPhone v3: lector PDF de nivel nativo iOS impulsado por Mozilla PDF.js
 // en Web Worker (fuera del hilo principal).
 //
-// Características:
-//   · Scroll nativo de iOS (UIScrollView / CoreAnimation a 60/120 Hz, sin tirones ni bloqueos WASM);
-//   · Pellizco acelerado por GPU (translate3d + scale) con commit atómico sin salto ni parpadeo;
-//   · Doble toque animado al punto exacto tocado y re-renderizado nítido en segundo plano (doble búfer);
-//   · Tiles HD recortados al área visible en zoom alto (>1.6×) para nitidez Retina sin exceder RAM en iOS;
-//   · Caché LRU de lienzos (máx. 7 páginas activas) para no superar el límite de memoria de Safari iOS;
-//   · Búsqueda instantánea en Worker con resaltado sobre las palabras, índice (outline), enlaces y texto.
+// Mejoras clave v3:
+//   · Streaming por Blob URL (disableAutoFetch: true) para abrir libros médicos de 100-400 MB
+//     sin duplicar el archivo completo en la RAM de Safari iOS;
+//   · Selección y copia de texto NATIVA multipárrafo y MULTIPÁGINA sin bloqueos:
+//     cada página visible y adyacente monta su capa de texto con ajuste scaleX real y
+//     `user-select: text` continuo a través de todo el visor, sin interceptar toques de 1 dedo;
+//   · Extracción estructurada de bloques/párrafos para Modo Líquido, Leer en voz alta y
+//     copia rápida de páginas o rangos completos;
+//   · Scroll nativo 60/120 Hz + pellizco GPU translate3d/scale con commit atómico + tiles HD Retina;
+//   · Seguimiento fluido del progreso de scroll para la pestaña vertical del borde derecho;
+//   · Renderizado de miniaturas en el mismo Worker para la vista nativa de Páginas / Organizar.
 (function () {
   "use strict";
 
   const MAX_CANVAS_PAGES = 7;
-  const MAX_BASE_DIM = 1550; // px máx del lienzo base por lado (rápido y seguro en RAM iOS)
-  const MAX_TILE_DIM = 2200; // px máx del tile HD visible por lado
-  const DOUBLE_TAP_MS = 320;
-  const DOUBLE_TAP_DIST = 38;
-  const LONG_PRESS_MS = 380;
-  const SLOP = 9;
+  const MAX_TEXT_LAYERS = 24;
+  const MAX_TEXT_CACHE = 45;
+  const MAX_BASE_DIM = 1550;
+  const MAX_TILE_DIM = 2200;
+  const DOUBLE_TAP_MS = 310;
+  const DOUBLE_TAP_DIST = 36;
+  const SLOP = 10;
 
   let pdfjsPromise = null;
   function loadPdfJs() {
@@ -32,11 +37,23 @@
     return pdfjsPromise;
   }
 
+  // Lienzo ligero reutilizable para medir el ancho exacto a 100px (cero redondeo subpíxel)
+  let measureCtx = null;
+  function measureTextWidth(str, fontSize, fontFamily) {
+    if (!measureCtx) {
+      const c = document.createElement("canvas");
+      measureCtx = c.getContext("2d");
+    }
+    measureCtx.font = "100px " + (fontFamily || "sans-serif");
+    return ((measureCtx.measureText(str).width || 0) * fontSize) / 100;
+  }
+
   function create() {
     let host = null;
     let scroller = null;
     let stage = null;
     let pdfDoc = null;
+    let objectUrl = null;
     let opts = {};
     let destroyed = false;
 
@@ -50,12 +67,11 @@
       fitScale: 1,
       minScale: 0.3,
       maxScale: 5.5,
-      dpr: 2,
-      pageDims: [],    // [{ w, h }] en puntos PDF (rotación 0)
-      slots: [],       // [{ num, el, baseCanvas, baseScale, hdCanvas, hdKey, textEl, annotEl, hlEl, task, hdTask, textLoaded, annotLoaded, lastUsed }]
-      textCache: new Map(), // pageNum -> { items, text }
+      pageDims: [],
+      slots: [],
+      textCache: new Map(), // LRU: pageNum -> { items, styles, vp1 }
       searchQuery: "",
-      searchMatches: [], // [{ page, idx, text }]
+      searchMatches: [],
       searchPos: -1,
       outline: null,
       hasForms: false,
@@ -63,15 +79,25 @@
       fwd: [],
       pinching: false,
       animatingZoom: false,
-      selectingPage: 0,
+      lastSelectedText: "",
     };
 
     let renderTimer = null;
     let hdTimer = null;
+    let selTimer = null;
     let scrollRaf = 0;
     let activeBaseRenders = 0;
     let activeHdRenders = 0;
+    let activeTextBuilds = 0;
     let zoomAnimTimer = null;
+
+    function rawCreateURL(blob) {
+      return (window.__pcRawCreateObjectURL || URL.createObjectURL)(blob);
+    }
+    function rawRevokeURL(url) {
+      if (!url) return;
+      try { (window.__pcRawRevokeObjectURL || URL.revokeObjectURL)(url); } catch (e) {}
+    }
 
     // ---------- Utilidades de geometría ----------
     function effectiveDpr() {
@@ -93,7 +119,7 @@
     function computeFitScale(pageNum) {
       const vp = viewportSize();
       const sz = pageRotatedSize(pageNum || S.page || 1);
-      const pad = 12;
+      const pad = 8;
       if (S.layout === "two-page") {
         const gap = S.pageGaps ? 8 : 0;
         return Math.max(0.15, (vp.w - pad * 2 - gap) / (sz.w * 2));
@@ -104,14 +130,13 @@
     function computeFitPageScale(pageNum) {
       const vp = viewportSize();
       const sz = pageRotatedSize(pageNum || S.page || 1);
-      const pad = 12;
+      const pad = 10;
       const sw = S.layout === "two-page" ? (vp.w - pad * 2 - (S.pageGaps ? 8 : 0)) / (sz.w * 2) : (vp.w - pad * 2) / sz.w;
       const sh = (vp.h - pad * 2) / sz.h;
       return Math.max(0.15, Math.min(sw, sh));
     }
 
     function zoomPercentOf(scale) {
-      // Escala 1.0 en PDF.js = 72pt * (96/72) = 96dpi -> 75% de 1.3333; normalizamos a 100% = 1.3333 como PdfCraft/Acrobat
       return Math.max(5, Math.round((scale / (96 / 72)) * 100));
     }
 
@@ -129,12 +154,10 @@
       S.slots = [];
 
       if (S.layout === "single") {
-        // En página única mostramos solo la página actual (más rápida y centrada).
         const slot = makeSlot(S.page);
         S.slots.push(slot);
         stage.append(slot.el);
       } else if (S.layout === "two-page") {
-        // Dos páginas por fila
         for (let i = 1; i <= S.pages; i += 2) {
           const row = document.createElement("div");
           row.className = "pc-spread-row";
@@ -149,7 +172,6 @@
           stage.append(row);
         }
       } else {
-        // Continuo: un contenedor ligero por página con sus dimensiones exactas.
         const frag = document.createDocumentFragment();
         for (let i = 1; i <= S.pages; i++) {
           const slot = makeSlot(i);
@@ -167,14 +189,17 @@
       el.dataset.page = String(num);
       const hlEl = document.createElement("div");
       hlEl.className = "pc-page-hl";
+      const textWrap = document.createElement("div");
+      textWrap.className = "pc-text-layer";
       const annotEl = document.createElement("div");
       annotEl.className = "pc-page-annots";
-      el.append(hlEl, annotEl);
+      // Orden de capas: canvas base -> canvas HD -> resaltados -> texto seleccionable -> enlaces/formularios
+      el.append(hlEl, textWrap, annotEl);
       return {
-        num, el, hlEl, annotEl,
+        num, el, hlEl, textWrap, annotEl,
         baseCanvas: null, baseScale: 0,
         hdCanvas: null, hdKey: "",
-        textEl: null, textLoaded: false,
+        textBuilt: false, textBuilding: false, textRot: -1, textScale: 0,
         annotLoaded: false,
         task: null, hdTask: null,
         lastUsed: 0,
@@ -187,6 +212,7 @@
       let maxW = 0;
       const gap = S.pageGaps ? Math.max(6, Math.round(10 * Math.min(2, S.scale / (S.fitScale || 1)))) : 0;
       stage.style.setProperty("--pc-gap", gap + "px");
+      stage.style.setProperty("--pc-scale", String(S.scale));
 
       for (const slot of S.slots) {
         const sz = pageRotatedSize(slot.num);
@@ -196,9 +222,14 @@
         slot.h = h;
         slot.el.style.width = w + "px";
         slot.el.style.height = h + "px";
+        // La capa de texto usa --pc-scale automáticamente vía calc() cuando se reescala
+        if (slot.textBuilt && slot.textRot === S.rotation) {
+          slot.textWrap.style.setProperty("--scale-factor", String(S.scale));
+          slot.textScale = S.scale;
+        }
         if (w > maxW) maxW = w;
       }
-      const neededW = S.layout === "two-page" ? (maxW * 2 + gap + 16) : (maxW + 16);
+      const neededW = S.layout === "two-page" ? (maxW * 2 + gap + 12) : (maxW + 12);
       stage.style.width = Math.max(vp.w, neededW) + "px";
     }
 
@@ -207,7 +238,28 @@
       return S.slots[num - 1] || null;
     }
 
-    // ---------- Gestión de memoria y cancelación de renders ----------
+    // ---------- Gestión de memoria y selección activa ----------
+    function hasActiveSelection() {
+      try {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+        const r = sel.getRangeAt(0);
+        return !!(host && host.contains(r.commonAncestorContainer));
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function isSlotInSelection(slot) {
+      try {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+        return sel.containsNode ? sel.containsNode(slot.textWrap, true) : false;
+      } catch (e) {
+        return false;
+      }
+    }
+
     function cancelSlotTasks(slot) {
       if (slot.task) { try { slot.task.cancel(); } catch (e) {} slot.task = null; }
       if (slot.hdTask) { try { slot.hdTask.cancel(); } catch (e) {} slot.hdTask = null; }
@@ -246,17 +298,32 @@
 
     function evictDistantCanvases(visibleSet) {
       const rendered = S.slots.filter((s) => s.baseCanvas && !visibleSet.has(s.num));
-      if (rendered.length + visibleSet.size <= MAX_CANVAS_PAGES) return;
-      rendered.sort((a, b) => a.lastUsed - b.lastUsed);
-      let toDrop = (rendered.length + visibleSet.size) - MAX_CANVAS_PAGES;
-      for (const slot of rendered) {
-        if (toDrop <= 0) break;
-        releaseSlotCanvas(slot);
-        toDrop--;
+      if (rendered.length + visibleSet.size > MAX_CANVAS_PAGES) {
+        rendered.sort((a, b) => a.lastUsed - b.lastUsed);
+        let toDrop = (rendered.length + visibleSet.size) - MAX_CANVAS_PAGES;
+        for (const slot of rendered) {
+          if (toDrop <= 0) break;
+          releaseSlotCanvas(slot);
+          toDrop--;
+        }
+      }
+      // Jamás limpiar capas de texto mientras el usuario está seleccionando entre varias páginas
+      if (!hasActiveSelection()) {
+        const withText = S.slots.filter((s) => s.textBuilt && !visibleSet.has(s.num) && !isSlotInSelection(s));
+        if (withText.length + visibleSet.size > MAX_TEXT_LAYERS) {
+          withText.sort((a, b) => a.lastUsed - b.lastUsed);
+          let dropTxt = (withText.length + visibleSet.size) - MAX_TEXT_LAYERS;
+          for (const slot of withText) {
+            if (dropTxt <= 0) break;
+            slot.textWrap.replaceChildren();
+            slot.textBuilt = false;
+            dropTxt--;
+          }
+        }
       }
     }
 
-    // ---------- Detección de páginas visibles y página actual ----------
+    // ---------- Detección de páginas visibles, progreso y página actual ----------
     function findVisibleSlots() {
       if (!scroller || !S.slots.length) return { visible: [], primary: S.page };
       if (S.layout === "single") {
@@ -266,7 +333,7 @@
       const topY = cr.top;
       const botY = cr.bottom;
       const midY = (topY + botY) * 0.5;
-      const margin = Math.max(240, cr.height * 0.7);
+      const margin = Math.max(280, cr.height * 0.85);
       const visible = [];
       let primary = S.page;
       let bestDist = Infinity;
@@ -289,6 +356,18 @@
       return { visible, primary };
     }
 
+    function reportScrollProgress() {
+      if (!scroller || !opts.onScrollProgress) return;
+      let frac = 0;
+      if (S.layout === "single") {
+        frac = S.pages > 1 ? (S.page - 1) / (S.pages - 1) : 0;
+      } else {
+        const maxST = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        frac = maxST > 0 ? Math.max(0, Math.min(1, scroller.scrollTop / maxST)) : 0;
+      }
+      opts.onScrollProgress(frac, S.page, S.pages);
+    }
+
     function updateVisible(immediate) {
       if (destroyed || !pdfDoc || S.pinching || S.animatingZoom) return;
       const { visible, primary } = findVisibleSlots();
@@ -296,19 +375,28 @@
         S.page = primary;
         if (opts.onPageChange) opts.onPageChange(S.page, S.pages);
       }
+      reportScrollProgress();
+
       const now = performance.now();
       const visSet = new Set();
       for (const slot of visible) {
         slot.lastUsed = now;
         visSet.add(slot.num);
       }
-      // Ordenar primero la página más cercana a la actual
       visible.sort((a, b) => Math.abs(a.num - S.page) - Math.abs(b.num - S.page));
       evictDistantCanvases(visSet);
 
-      // Limpiar tiles HD en páginas fuera de vista
       for (const slot of S.slots) {
         if (!visSet.has(slot.num) && slot.hdCanvas) releaseHd(slot);
+      }
+
+      // También precargar capa de texto en la página anterior y siguiente para arrastrar selección entre páginas sin cortes
+      const textTargets = visible.slice();
+      if (S.layout !== "single") {
+        const prevSlot = getSlot(S.page - 1);
+        const nextSlot = getSlot(S.page + 1);
+        if (prevSlot && !visSet.has(prevSlot.num)) { prevSlot.lastUsed = now; textTargets.push(prevSlot); }
+        if (nextSlot && !visSet.has(nextSlot.num)) { nextSlot.lastUsed = now; textTargets.push(nextSlot); }
       }
 
       for (const slot of visible) {
@@ -316,21 +404,21 @@
         if (!slot.annotLoaded) loadSlotAnnotations(slot);
         if (S.searchQuery) paintSearchHighlights(slot);
       }
+      for (const slot of textTargets) {
+        ensureTextLayer(slot);
+      }
 
       clearTimeout(hdTimer);
       hdTimer = setTimeout(() => {
         if (destroyed || !pdfDoc || S.pinching || S.animatingZoom) return;
         const cur = findVisibleSlots().visible;
         for (const slot of cur) ensureHdTile(slot);
-      }, immediate ? 20 : 90);
+      }, immediate ? 20 : 95);
     }
 
     function scheduleUpdate(delayMs) {
       clearTimeout(renderTimer);
-      if (!delayMs) {
-        updateVisible(false);
-        return;
-      }
+      if (!delayMs) { updateVisible(false); return; }
       renderTimer = setTimeout(() => updateVisible(false), delayMs);
     }
 
@@ -346,13 +434,11 @@
         return;
       }
       if (slot.task) {
-        // Ya hay un render en curso; si la escala cambió mucho, reiniciarlo
         if (Math.abs((slot.pendingBaseScale || 0) - targetScale) / Math.max(0.01, targetScale) < 0.08) return;
         try { slot.task.cancel(); } catch (e) {}
         slot.task = null;
       }
       if (activeBaseRenders >= 2) {
-        // Reintentar al terminar los actuales para no saturar WebKit
         setTimeout(() => ensureBaseRendered(slot), 45);
         return;
       }
@@ -362,7 +448,6 @@
       try {
         const page = await pdfDoc.getPage(slot.num);
         if (destroyed || !pdfDoc) return;
-        // Actualizar dimensión real si difería del estimado de la página 1
         const vp1 = page.getViewport({ scale: 1, rotation: 0 });
         const curDim = S.pageDims[slot.num - 1];
         if (!curDim || Math.abs(curDim.w - vp1.width) > 1 || Math.abs(curDim.h - vp1.height) > 1) {
@@ -373,7 +458,6 @@
         const cw = Math.max(1, Math.floor(viewport.width));
         const ch = Math.max(1, Math.floor(viewport.height));
 
-        // Lienzo fuera de pantalla (doble búfer): el lienzo previo queda visible sin parpadeo blanco.
         const off = document.createElement("canvas");
         off.className = "pc-page-base";
         off.width = cw;
@@ -395,43 +479,35 @@
         const old = slot.baseCanvas;
         slot.baseCanvas = off;
         slot.el.insertBefore(off, slot.el.firstChild);
-        if (old) {
-          old.width = 0;
-          old.height = 0;
-          old.remove();
-        }
+        if (old) { old.width = 0; old.height = 0; old.remove(); }
 
-        // Generar miniatura instantánea de la página 1 si aún no existe
         if (slot.num === 1 && opts.onFirstThumb && !S.thumbSent) {
           S.thumbSent = true;
           try {
-            const tw = 160;
-            const th = Math.max(80, Math.round((tw * ch) / cw));
+            const tw = 220;
+            const th = Math.max(100, Math.round((tw * ch) / cw));
             const tc = document.createElement("canvas");
             tc.width = tw; tc.height = th;
             const tctx = tc.getContext("2d");
             tctx.fillStyle = "#ffffff";
             tctx.fillRect(0, 0, tw, th);
             tctx.drawImage(off, 0, 0, cw, ch, 0, 0, tw, th);
-            opts.onFirstThumb(tc.toDataURL("image/jpeg", 0.74));
+            opts.onFirstThumb(tc.toDataURL("image/jpeg", 0.78));
             tc.width = 0; tc.height = 0;
           } catch (e) {}
         }
       } catch (e) {
-        if (!e || e.name !== "RenderingCancelledException") {
-          // Silencioso si fue cancelado por scroll rápido
-        }
+        // Cancelado por scroll rápido
       } finally {
         activeBaseRenders = Math.max(0, activeBaseRenders - 1);
       }
     }
 
-    // ---------- Tile HD recortado al viewport en zoom alto (>1.5×) ----------
+    // ---------- Tile HD recortado al viewport en zoom alto ----------
     async function ensureHdTile(slot) {
       if (destroyed || !pdfDoc || S.pinching || S.animatingZoom) return;
       const dpr = effectiveDpr();
       const desiredScale = S.scale * dpr;
-      // Solo hace falta tile HD si el lienzo base quedó por debajo de la resolución Retina deseada
       if (slot.baseCanvas && slot.baseScale >= desiredScale * 0.92) {
         releaseHd(slot);
         return;
@@ -443,7 +519,6 @@
         return;
       }
 
-      // Intersección visible + margen de 90px para panear suavemente
       const pad = 90;
       const vx0 = Math.max(0, Math.floor((cr.left - pad) - pr.left));
       const vy0 = Math.max(0, Math.floor((cr.top - pad) - pr.top));
@@ -453,7 +528,6 @@
       const th = vy1 - vy0;
       if (tw < 20 || th < 20) return;
 
-      // Escalar tileDpr para jamás pasar de MAX_TILE_DIM en Safari iOS
       const tileDpr = Math.min(dpr, MAX_TILE_DIM / Math.max(tw, th));
       const key = `${S.scale.toFixed(3)}:${S.rotation}:${vx0},${vy0},${tw},${th}:${tileDpr.toFixed(2)}`;
       if (slot.hdKey === key && slot.hdCanvas) return;
@@ -496,20 +570,270 @@
 
         const old = slot.hdCanvas;
         slot.hdCanvas = off;
-        // Colocar justo encima del lienzo base y debajo de resaltados/enlaces
         if (slot.baseCanvas && slot.baseCanvas.nextSibling) {
           slot.el.insertBefore(off, slot.baseCanvas.nextSibling);
         } else {
           slot.el.insertBefore(off, slot.hlEl);
         }
-        if (old) {
-          old.width = 0; old.height = 0; old.remove();
-        }
+        if (old) { old.width = 0; old.height = 0; old.remove(); }
       } catch (e) {
-        // Cancelado por nuevo scroll/zoom
       } finally {
         activeHdRenders = Math.max(0, activeHdRenders - 1);
       }
+    }
+
+    // ---------- Capa de texto SIEMPRE ACTIVA multipágina con ajuste scaleX ----------
+    // Cada coordenada se expresa con `calc(val * var(--scale-factor))` para que hacer zoom
+    // reescale los textos al instante sin reconstruir el DOM ni perder la selección.
+    async function ensureTextLayer(slot) {
+      if (destroyed || !pdfDoc) return;
+      if (slot.textBuilt && slot.textRot === S.rotation) {
+        if (slot.textScale !== S.scale) {
+          slot.textWrap.style.setProperty("--scale-factor", String(S.scale));
+          slot.textScale = S.scale;
+        }
+        return;
+      }
+      if (slot.textBuilding) return;
+      if (activeTextBuilds >= 2) {
+        setTimeout(() => { if (!destroyed && pdfDoc && !slot.textBuilt) ensureTextLayer(slot); }, 60);
+        return;
+      }
+
+      slot.textBuilding = true;
+      activeTextBuilds++;
+      const buildRot = S.rotation;
+      try {
+        const page = await pdfDoc.getPage(slot.num);
+        if (destroyed || !pdfDoc || buildRot !== S.rotation) return;
+        const tc = await getPageTextData(slot.num, page);
+        if (destroyed || !pdfDoc || buildRot !== S.rotation) return;
+        const vp1 = page.getViewport({ scale: 1, rotation: buildRot });
+
+        const frag = document.createDocumentFragment();
+        const items = tc.items || [];
+        const styles = tc.styles || {};
+
+        let prevRight = -999;
+        let prevBaseline = -999;
+        let prevFontH = 10;
+
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const str = item.str;
+          if (!str) {
+            if (item.hasEOL) frag.append(document.createElement("br"));
+            continue;
+          }
+          const tx = multiplyTransform(vp1.transform, item.transform);
+          const fontH = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 10;
+          const angle = Math.atan2(tx[1], tx[0]);
+          const left = tx[4];
+          const baseline = tx[5];
+          const top = baseline - fontH * 0.86;
+          const styleObj = styles[item.fontName];
+          const family = (styleObj && styleObj.fontFamily) || "sans-serif";
+          const targetW = item.width > 0 ? item.width : 0;
+
+          // Separación real con <br> / espacios para que copiar párrafos y varias páginas
+          // produzca saltos de línea limpios y jamás pegue palabras
+          if (i > 0) {
+            const dy = Math.abs(baseline - prevBaseline);
+            if (dy > Math.max(fontH, prevFontH) * 0.55) {
+              frag.append(document.createElement("br"));
+            } else if (left - prevRight > Math.max(1.2, fontH * 0.14) && !str.startsWith(" ")) {
+              frag.append(document.createTextNode(" "));
+            }
+          }
+
+          const span = document.createElement("span");
+          span.textContent = str;
+          span.style.left = left.toFixed(2) + "px";
+          span.style.top = top.toFixed(2) + "px";
+          span.style.fontSize = Math.max(4, fontH).toFixed(2) + "px";
+          span.style.fontFamily = family;
+
+          const transforms = [];
+          if (Math.abs(angle) > 0.01) transforms.push(`rotate(${angle.toFixed(4)}rad)`);
+          if (targetW > 0.5 && str.trim().length > 0) {
+            const measured = measureTextWidth(str, Math.max(4, fontH), family);
+            if (measured > 0.5) {
+              const sx = Math.max(0.5, Math.min(2.4, targetW / measured));
+              if (Math.abs(sx - 1) > 0.015) transforms.push(`scaleX(${sx.toFixed(4)})`);
+            }
+          }
+          if (transforms.length) span.style.transform = transforms.join(" ");
+          frag.append(span);
+          if (item.hasEOL) frag.append(document.createElement("br"));
+
+          prevRight = left + (targetW || (str.length * fontH * 0.5));
+          prevBaseline = baseline;
+          prevFontH = fontH;
+        }
+        // Salto de página limpio al copiar entre página N y página N+1
+        if (items.length) {
+          frag.append(document.createElement("br"), document.createElement("br"));
+        }
+
+        slot.textWrap.style.width = vp1.width.toFixed(2) + "px";
+        slot.textWrap.style.height = vp1.height.toFixed(2) + "px";
+        slot.textWrap.style.setProperty("--scale-factor", String(S.scale));
+        slot.textWrap.replaceChildren(frag);
+        slot.textBuilt = true;
+        slot.textRot = buildRot;
+        slot.textScale = S.scale;
+      } catch (e) {
+      } finally {
+        slot.textBuilding = false;
+        activeTextBuilds = Math.max(0, activeTextBuilds - 1);
+      }
+    }
+
+    function multiplyTransform(m1, m2) {
+      return [
+        m1[0] * m2[0] + m1[2] * m2[1],
+        m1[1] * m2[0] + m1[3] * m2[1],
+        m1[0] * m2[2] + m1[2] * m2[3],
+        m1[1] * m2[2] + m1[3] * m2[3],
+        m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+        m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+      ];
+    }
+
+    async function getPageTextData(num, pageObj) {
+      if (S.textCache.has(num)) {
+        const hit = S.textCache.get(num);
+        S.textCache.delete(num);
+        S.textCache.set(num, hit);
+        return hit;
+      }
+      const page = pageObj || (await pdfDoc.getPage(num));
+      const content = await page.getTextContent();
+      const data = {
+        items: content.items || [],
+        styles: content.styles || {},
+        vp1: page.getViewport({ scale: 1, rotation: 0 }),
+      };
+      S.textCache.set(num, data);
+      if (S.textCache.size > MAX_TEXT_CACHE) {
+        const oldest = S.textCache.keys().next().value;
+        S.textCache.delete(oldest);
+      }
+      return data;
+    }
+
+    // ---------- Extracción estructurada de texto (Modo Líquido, Voz alta y Copiar rango) ----------
+    async function getPageBlocks(num) {
+      if (!pdfDoc) return [];
+      const data = await getPageTextData(num);
+      const items = data.items || [];
+      if (!items.length) return [];
+
+      // Agrupar items en líneas visuales
+      const lines = [];
+      let curLine = null;
+      const heights = [];
+
+      for (const it of items) {
+        const str = String(it.str || "");
+        if (!str.trim() && !it.hasEOL) continue;
+        const tx = it.transform || [1, 0, 0, 1, 0, 0];
+        const fh = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 10;
+        const x = tx[4];
+        const y = tx[5]; // En coordenadas PDF, Y sube hacia arriba
+        if (str.trim()) heights.push(fh);
+
+        if (!curLine) {
+          curLine = { y, fh, xMin: x, xMax: x + (it.width || 0), parts: [str] };
+          lines.push(curLine);
+        } else if (Math.abs(y - curLine.y) <= Math.max(fh, curLine.fh) * 0.55) {
+          const gap = x - curLine.xMax;
+          if (gap > Math.max(1.2, fh * 0.14) && !curLine.parts[curLine.parts.length - 1].endsWith(" ") && !str.startsWith(" ")) {
+            curLine.parts.push(" ");
+          }
+          curLine.parts.push(str);
+          curLine.xMax = Math.max(curLine.xMax, x + (it.width || str.length * fh * 0.5));
+          curLine.fh = Math.max(curLine.fh, fh);
+        } else {
+          curLine = { y, fh, xMin: x, xMax: x + (it.width || 0), parts: [str] };
+          lines.push(curLine);
+        }
+        if (it.hasEOL) curLine = null;
+      }
+
+      if (!lines.length) return [];
+      heights.sort((a, b) => a - b);
+      const bodyH = heights[Math.floor(heights.length * 0.5)] || 11;
+
+      const blocks = [];
+      let curPara = null;
+      let prevLine = null;
+
+      for (const ln of lines) {
+        const text = ln.parts.join("").replace(/[ \t]+/g, " ").trim();
+        if (!text) continue;
+        const isHeading = ln.fh >= bodyH * 1.28 && text.length < 160;
+        const isBullet = /^[•●▪▸\-–—*]\s+|^\d+[.)]\s+/.test(text);
+        const yGap = prevLine ? Math.abs(prevLine.y - ln.y) : 0;
+        const newPara = !curPara || isHeading || curPara.type === "h" || isBullet ||
+          (prevLine && yGap > Math.max(ln.fh, prevLine.fh) * 1.55);
+
+        if (newPara) {
+          curPara = { type: isHeading ? "h" : "p", text };
+          blocks.push(curPara);
+        } else {
+          if (curPara.text.endsWith("-") && !curPara.text.endsWith(" -") && /^[a-záéíóúñü]/i.test(text)) {
+            curPara.text = curPara.text.slice(0, -1) + text;
+          } else {
+            curPara.text += " " + text;
+          }
+        }
+        prevLine = ln;
+      }
+      return blocks;
+    }
+
+    async function getPagePlainText(num) {
+      const blocks = await getPageBlocks(num);
+      return blocks.map((b) => b.text).join("\n\n");
+    }
+
+    async function extractTextRange(fromPage, toPage, onProgress) {
+      if (!pdfDoc) return "";
+      const a = Math.max(1, Math.min(S.pages, parseInt(fromPage, 10) || 1));
+      const b = Math.max(a, Math.min(S.pages, parseInt(toPage, 10) || a));
+      const out = [];
+      for (let p = a; p <= b; p++) {
+        if (destroyed || !pdfDoc) break;
+        const txt = await getPagePlainText(p);
+        if (txt) {
+          out.push(b > a ? (`--- Página ${p} ---\n` + txt) : txt);
+        }
+        if (onProgress) onProgress(p - a + 1, b - a + 1);
+      }
+      return out.join("\n\n");
+    }
+
+    // ---------- Miniatura rápida para Organizar páginas (reutiliza el mismo Worker) ----------
+    async function renderThumbnail(pageNum, maxWidth, extraRotation) {
+      if (destroyed || !pdfDoc) return null;
+      const page = await pdfDoc.getPage(pageNum);
+      if (destroyed || !pdfDoc) return null;
+      const rot = ((extraRotation || 0) % 360 + 360) % 360;
+      const vp1 = page.getViewport({ scale: 1, rotation: rot });
+      const scale = Math.max(0.12, Math.min(1.2, (maxWidth || 220) / Math.max(1, vp1.width)));
+      const vp = page.getViewport({ scale, rotation: rot });
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(vp.width));
+      c.height = Math.max(1, Math.round(vp.height));
+      const ctx = c.getContext("2d", { alpha: false });
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, c.width, c.height);
+      const task = page.render({ canvasContext: ctx, viewport: vp, intent: "display" });
+      await task.promise;
+      const url = c.toDataURL("image/jpeg", 0.76);
+      c.width = 0; c.height = 0;
+      return url;
     }
 
     // ---------- Enlaces y detección de formularios ----------
@@ -582,71 +906,8 @@
       }
     }
 
-    // ---------- Capa de texto bajo demanda (pulsación larga para copiar/resaltar) ----------
-    async function ensureTextLayer(slot) {
-      if (destroyed || !pdfDoc) return null;
-      if (slot.textEl && slot.textScale === S.scale && slot.textRot === S.rotation) return slot.textEl;
-      const page = await pdfDoc.getPage(slot.num);
-      if (destroyed || !pdfDoc) return null;
-      const tc = await getPageTextData(slot.num, page);
-      const vp = page.getViewport({ scale: S.scale, rotation: S.rotation });
-
-      if (slot.textEl) slot.textEl.remove();
-      const layer = document.createElement("div");
-      layer.className = "pc-text-layer";
-      const frag = document.createDocumentFragment();
-      for (const item of tc.items) {
-        if (!item.str) continue;
-        const tx = multiplyTransform(vp.transform, item.transform);
-        const fontHeight = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 10;
-        const angle = Math.atan2(tx[1], tx[0]);
-        const span = document.createElement("span");
-        span.textContent = item.str;
-        const left = tx[4];
-        const top = tx[5] - fontHeight * 0.85;
-        const width = Math.max(2, (item.width || 0) * S.scale);
-        span.style.left = left.toFixed(1) + "px";
-        span.style.top = top.toFixed(1) + "px";
-        span.style.fontSize = Math.max(4, fontHeight).toFixed(1) + "px";
-        span.style.minWidth = width.toFixed(1) + "px";
-        if (Math.abs(angle) > 0.01) span.style.transform = `rotate(${angle.toFixed(3)}rad)`;
-        frag.append(span);
-      }
-      layer.append(frag);
-      slot.el.append(layer);
-      slot.textEl = layer;
-      slot.textScale = S.scale;
-      slot.textRot = S.rotation;
-      return layer;
-    }
-
-    function multiplyTransform(m1, m2) {
-      return [
-        m1[0] * m2[0] + m1[2] * m2[1],
-        m1[1] * m2[0] + m1[3] * m2[1],
-        m1[0] * m2[2] + m1[2] * m2[3],
-        m1[1] * m2[2] + m1[3] * m2[3],
-        m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
-        m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
-      ];
-    }
-
-    async function getPageTextData(num, pageObj) {
-      if (S.textCache.has(num)) return S.textCache.get(num);
-      const page = pageObj || (await pdfDoc.getPage(num));
-      const content = await page.getTextContent();
-      const items = content.items || [];
-      const data = { items, vp1: page.getViewport({ scale: 1, rotation: 0 }) };
-      S.textCache.set(num, data);
-      return data;
-    }
-
     function clearSelection() {
-      if (S.selectingPage) {
-        const old = getSlot(S.selectingPage);
-        if (old && old.textEl) old.textEl.classList.remove("pc-selecting");
-        S.selectingPage = 0;
-      }
+      S.lastSelectedText = "";
       try {
         const sel = window.getSelection();
         if (sel && sel.rangeCount) sel.removeAllRanges();
@@ -655,8 +916,13 @@
     }
 
     function getSelectedText() {
-      try { return String((window.getSelection && window.getSelection().toString()) || "").trim(); }
-      catch (e) { return ""; }
+      try {
+        const sel = window.getSelection();
+        const cur = sel ? String(sel.toString() || "").replace(/\n{3,}/g, "\n\n").trim() : "";
+        return cur || S.lastSelectedText || "";
+      } catch (e) {
+        return S.lastSelectedText || "";
+      }
     }
 
     // ---------- Búsqueda ultrarrápida en Worker ----------
@@ -689,7 +955,6 @@
       S.searchMatches = matches;
       if (!matches.length) return { current: 0, total: 0, label: "Sin resultados" };
 
-      // Ir a la primera coincidencia desde la página actual en adelante
       let idx = matches.findIndex((m) => m.page >= S.page);
       if (idx < 0) idx = 0;
       return jumpToMatch(idx);
@@ -715,18 +980,14 @@
     function paintSearchHighlights(slot) {
       slot.hlEl.replaceChildren();
       if (!S.searchQuery || !S.searchMatches.length) return;
-      const data = S.textCache.get(slot.num);
-      if (!data) return;
       const pageMatches = S.searchMatches
         .map((m, idx) => ({ m, idx }))
         .filter((x) => x.m.page === slot.num);
       if (!pageMatches.length) return;
-      const sz = pageRotatedSize(slot.num);
-      const vp1 = { width: sz.w, height: sz.h };
-      // Construir matriz de página a coordenadas % (independiente del zoom!)
       const rot = S.rotation;
-      // Usamos transform de PDF.js con escala 1 y rotación actual si ya tenemos la página
-      pdfDoc.getPage(slot.num).then((page) => {
+      getPageTextData(slot.num).then(async (data) => {
+        if (destroyed || !S.searchQuery || !pdfDoc) return;
+        const page = await pdfDoc.getPage(slot.num);
         if (destroyed || !S.searchQuery) return;
         const vp = page.getViewport({ scale: 1, rotation: rot });
         const frag = document.createDocumentFragment();
@@ -760,7 +1021,7 @@
       for (const slot of S.slots) slot.hlEl.replaceChildren();
     }
 
-    // ---------- Índice (Table of Contents / Outline) ----------
+    // ---------- Índice (Outline / Marcadores del PDF) ----------
     async function loadOutline() {
       if (!pdfDoc) return [];
       try {
@@ -791,6 +1052,7 @@
         if (S.back.length > 60) S.back.shift();
       }
       S.fwd = [];
+      if (opts.onHistoryChange) opts.onHistoryChange(S.back[S.back.length - 1] || 0);
     }
 
     function goToPage(n, navOpts) {
@@ -811,23 +1073,45 @@
         const slot = getSlot(target);
         if (slot) {
           const top = Math.max(0, slot.el.offsetTop - 8);
-          scroller.scrollTo({ top, behavior: o.instant ? "auto" : "auto" });
+          scroller.scrollTop = top;
         }
       }
       if (prev !== target && opts.onPageChange) opts.onPageChange(S.page, S.pages);
+      reportScrollProgress();
       updateVisible(true);
+    }
+
+    function scrollToFraction(frac) {
+      if (!pdfDoc || !scroller) return S.page;
+      const f = Math.max(0, Math.min(1, frac));
+      if (S.layout === "single") {
+        const pg = Math.max(1, Math.min(S.pages, Math.round(1 + f * (S.pages - 1))));
+        if (pg !== S.page) goToPage(pg, { instant: true });
+        return pg;
+      }
+      const maxST = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      scroller.scrollTop = Math.round(f * maxST);
+      const { primary } = findVisibleSlots();
+      if (primary !== S.page) {
+        S.page = primary;
+        if (opts.onPageChange) opts.onPageChange(S.page, S.pages);
+      }
+      scheduleUpdate(60);
+      return S.page;
     }
 
     function stepPage(dir) {
       const step = S.layout === "two-page" ? 2 : 1;
       const target = Math.max(1, Math.min(S.pages, S.page + (dir > 0 ? step : -step)));
       if (target !== S.page) goToPage(target, { instant: true });
+      return target;
     }
 
     function back() {
       if (!S.back.length) return false;
       const to = S.back.pop();
       S.fwd.push(S.page);
+      if (opts.onHistoryChange) opts.onHistoryChange(S.back[S.back.length - 1] || 0);
       goToPage(to, { instant: true });
       return true;
     }
@@ -836,6 +1120,7 @@
       if (!S.fwd.length) return false;
       const to = S.fwd.pop();
       S.back.push(S.page);
+      if (opts.onHistoryChange) opts.onHistoryChange(S.back[S.back.length - 1] || 0);
       goToPage(to, { instant: true });
       return true;
     }
@@ -868,7 +1153,6 @@
     function commitScaleAt(newScale, anchor) {
       const clamped = Math.max(S.minScale, Math.min(S.maxScale, newScale));
       S.scale = clamped;
-      // Limpiar transformación GPU, redimensionar slots y restaurar scroll en UN SOLO frame síncrono!
       stage.style.transition = "";
       stage.style.transform = "";
       stage.style.transformOrigin = "";
@@ -885,9 +1169,9 @@
         scroller.scrollTop = Math.max(0, Math.min(maxST, pageTop + anchor.fy * el.offsetHeight - anchor.vy));
       }
 
-      // Invalidar tiles HD viejos (el lienzo base sigue visible estirado sin parpadeo hasta que llegue el HD)
       for (const slot of S.slots) releaseHd(slot);
       if (opts.onZoomChange) opts.onZoomChange(zoomPercentOf(S.scale));
+      reportScrollProgress();
       updateVisible(true);
     }
 
@@ -971,12 +1255,20 @@
       S.fitScale = computeFitScale(cur);
       S.scale = S.fitScale;
       releaseAllCanvases();
-      for (const slot of S.slots) { slot.annotLoaded = false; slot.annotEl.replaceChildren(); }
+      for (const slot of S.slots) {
+        slot.annotLoaded = false;
+        slot.annotEl.replaceChildren();
+        slot.textBuilt = false;
+        slot.textWrap.replaceChildren();
+      }
       applySlotSizes();
       goToPage(cur, { instant: true });
     }
 
-    // ---------- Gestos táctiles nativos (scroll nativo 1 dedo + pellizco GPU 2 dedos + doble toque + selección) ----------
+    // ---------- Gestos táctiles 100 % compatibles con selección nativa multipágina de iOS ----------
+    // Regla de oro: NUNCA bloquear 1 dedo en touchstart/touchmove (salvo swipe en Página única sin selección)
+    // para que Safari iOS permita mantener pulsado y arrastrar los tiradores azules entre párrafos y páginas
+    // con desplazamiento automático suave y cero bloqueos.
     let cleanupListeners = null;
     function attachGestures() {
       if (!scroller) return;
@@ -985,7 +1277,6 @@
       let tap = null;
       let lastTap = { t: 0, x: 0, y: 0 };
       let singleTapTimer = null;
-      let longPressTimer = null;
       let swipeDx = 0;
       let lastScrollAt = 0;
 
@@ -997,7 +1288,6 @@
 
       function startPinch(a, b) {
         clearTimeout(singleTapTimer);
-        clearTimeout(longPressTimer);
         clearTimeout(zoomAnimTimer);
         S.animatingZoom = false;
         tap = null;
@@ -1064,20 +1354,21 @@
           return;
         }
         if (pinch) return;
-        // No interferir si se tocó un enlace o campo de formulario
         if (e.target && e.target.closest && e.target.closest(".pc-pdf-link, .pc-pdf-field")) return;
+        // No rastrear toques de doble toque / inmersivo si ya hay texto seleccionado (dejamos arrastrar tiradores libres)
+        const hadSel = hasActiveSelection();
         const t = e.touches[0];
         const now = performance.now();
-        const wasScrolling = (now - lastScrollAt) < 90;
-        tap = { id: t.identifier, x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, t0: now, moved: false, longPressed: false, swiping: false, wasScrolling };
-        clearTimeout(longPressTimer);
-        if (!wasScrolling) {
-          longPressTimer = setTimeout(() => {
-            if (!tap || tap.moved || pinch) return;
-            tap.longPressed = true;
-            triggerLongPress(tap.x0, tap.y0);
-          }, LONG_PRESS_MS);
-        }
+        tap = {
+          id: t.identifier,
+          x0: t.clientX, y0: t.clientY,
+          x: t.clientX, y: t.clientY,
+          t0: now,
+          moved: false,
+          swiping: false,
+          hadSel,
+          wasScrolling: (now - lastScrollAt) < 90,
+        };
       }
 
       function onTouchMove(e) {
@@ -1104,9 +1395,7 @@
         const dx = tap.x - tap.x0, dy = tap.y - tap.y0;
         if (!tap.moved && Math.hypot(dx, dy) >= SLOP) {
           tap.moved = true;
-          clearTimeout(longPressTimer);
-          // En página única encajada al ancho, deslizar horizontalmente pasa página suavemente
-          if (S.layout === "single" && S.scale <= S.fitScale * 1.05 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+          if (!tap.hadSel && !hasActiveSelection() && S.layout === "single" && S.scale <= S.fitScale * 1.06 && Math.abs(dx) > Math.abs(dy) * 1.45) {
             tap.swiping = true;
           }
         }
@@ -1119,14 +1408,12 @@
 
       function onTouchEnd(e) {
         if (pinch) {
-          const remaining = e.touches.length;
-          if (remaining < 2) {
+          if (e.touches.length < 2) {
             e.preventDefault();
             finishPinch(e.type === "touchcancel");
           }
           return;
         }
-        clearTimeout(longPressTimer);
         if (!tap) return;
         const ended = Array.prototype.find.call(e.changedTouches, (x) => x.identifier === tap.id);
         if (!ended) return;
@@ -1139,16 +1426,14 @@
           stage.style.transform = "";
           swipeDx = 0;
           setTimeout(() => { if (stage) stage.style.transition = ""; }, 170);
-          if (e.type !== "touchcancel" && Math.abs(dx) > 52) {
+          if (e.type !== "touchcancel" && Math.abs(dx) > 50) {
             stepPage(dx < 0 ? 1 : -1);
           }
           return;
         }
-        if (was.moved || was.longPressed || was.wasScrolling || e.type === "touchcancel") return;
-
-        // Si había texto seleccionado, tocar la página limpia la selección
-        if (S.selectingPage) {
-          clearSelection();
+        // Si fue pulsación larga (>360ms), arrastre, scroll o selección activa, no disparar tap/doble toque
+        const dt = performance.now() - was.t0;
+        if (was.moved || was.wasScrolling || was.hadSel || dt > 340 || e.type === "touchcancel" || hasActiveSelection()) {
           return;
         }
 
@@ -1165,42 +1450,8 @@
         lastTap = { t: now, x: was.x0, y: was.y0 };
         clearTimeout(singleTapTimer);
         singleTapTimer = setTimeout(() => {
-          if (opts.onSingleTap) opts.onSingleTap(was.x0, was.y0);
+          if (!hasActiveSelection() && opts.onSingleTap) opts.onSingleTap(was.x0, was.y0);
         }, DOUBLE_TAP_MS);
-      }
-
-      async function triggerLongPress(clientX, clientY) {
-        if (opts.onLongPress) opts.onLongPress(clientX, clientY);
-        const anchor = findAnchorAt(clientX, clientY);
-        if (!anchor || !anchor.slot) return;
-        const slot = anchor.slot;
-        const layer = await ensureTextLayer(slot);
-        if (!layer || destroyed) return;
-        if (S.selectingPage && S.selectingPage !== slot.num) clearSelection();
-        S.selectingPage = slot.num;
-        layer.classList.add("pc-selecting");
-
-        // Seleccionar el span de texto más cercano al dedo para que aparezcan los tiradores nativos de iOS
-        let best = null;
-        let bestD = Infinity;
-        for (const sp of layer.children) {
-          const r = sp.getBoundingClientRect();
-          const dx = clientX < r.left ? r.left - clientX : clientX > r.right ? clientX - r.right : 0;
-          const dy = clientY < r.top ? r.top - clientY : clientY > r.bottom ? clientY - r.bottom : 0;
-          const d = dx + dy * 2;
-          if (d < bestD) { bestD = d; best = sp; }
-        }
-        if (best && bestD < 48) {
-          try {
-            const range = document.createRange();
-            range.selectNodeContents(best);
-            const sel = window.getSelection();
-            sel.removeAllRanges();
-            sel.addRange(range);
-            const text = String(sel.toString() || "").trim();
-            if (text && opts.onSelectionChange) opts.onSelectionChange(text, slot.num);
-          } catch (e) {}
-        }
       }
 
       function onScroll() {
@@ -1213,15 +1464,31 @@
       }
 
       function onSelectionChangeDom() {
-        if (!S.selectingPage) return;
-        const txt = getSelectedText();
-        if (opts.onSelectionChange) opts.onSelectionChange(txt, S.selectingPage);
+        clearTimeout(selTimer);
+        selTimer = setTimeout(() => {
+          if (destroyed || !host) return;
+          try {
+            const sel = window.getSelection();
+            if (!sel || sel.isCollapsed || !sel.rangeCount) {
+              if (S.lastSelectedText) {
+                S.lastSelectedText = "";
+                if (opts.onSelectionChange) opts.onSelectionChange("");
+              }
+              return;
+            }
+            const range = sel.getRangeAt(0);
+            if (!host.contains(range.commonAncestorContainer)) return;
+            const txt = String(sel.toString() || "").replace(/\n{3,}/g, "\n\n").trim();
+            if (txt !== S.lastSelectedText) {
+              S.lastSelectedText = txt;
+              if (opts.onSelectionChange) opts.onSelectionChange(txt, S.page);
+            }
+          } catch (e) {}
+        }, 70);
       }
 
-      // Bloquear gestos nativos de zoom de Safari sobre el visor (nosotros lo hacemos a 120fps)
       const blockGesture = (e) => { e.preventDefault(); };
 
-      // Rueda con Ctrl en escritorio / trackpad (también útil para depuración y iPad con trackpad)
       function onWheel(e) {
         if (!e.ctrlKey && !e.metaKey) return;
         e.preventDefault();
@@ -1243,8 +1510,8 @@
 
       cleanupListeners = () => {
         clearTimeout(singleTapTimer);
-        clearTimeout(longPressTimer);
         clearTimeout(zoomAnimTimer);
+        clearTimeout(selTimer);
         if (pinchRaf) { cancelAnimationFrame(pinchRaf); pinchRaf = 0; }
         if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = 0; }
         scroller.removeEventListener("touchstart", onTouchStart);
@@ -1279,43 +1546,70 @@
       S.searchQuery = "";
       S.searchMatches = [];
       S.searchPos = -1;
-
-      const bytes = blobOrBytes instanceof Uint8Array
-        ? new Uint8Array(blobOrBytes)
-        : blobOrBytes instanceof ArrayBuffer
-          ? new Uint8Array(blobOrBytes.slice(0))
-          : new Uint8Array(await blobOrBytes.arrayBuffer());
+      S.lastSelectedText = "";
 
       const pdfjsLib = await loadPdfJs();
       if (destroyed) return null;
 
-      const loadingTask = pdfjsLib.getDocument({
-        data: bytes,
-        standardFontDataUrl: "./pdfjs/standard_fonts/",
-        isEvalSupported: false,
-        useSystemFonts: true,
-      });
+      // Streaming por Blob URL: evita copiar PDFs de 100-400 MB en el heap JS de Safari iOS!
+      let docOpts;
+      if (blobOrBytes instanceof Blob) {
+        objectUrl = rawCreateURL(blobOrBytes);
+        docOpts = {
+          url: objectUrl,
+          standardFontDataUrl: "./pdfjs/standard_fonts/",
+          isEvalSupported: false,
+          useSystemFonts: true,
+          disableAutoFetch: true,
+          rangeChunkSize: 262144,
+        };
+      } else {
+        const bytes = blobOrBytes instanceof Uint8Array
+          ? new Uint8Array(blobOrBytes)
+          : new Uint8Array(blobOrBytes.slice(0));
+        docOpts = {
+          data: bytes,
+          standardFontDataUrl: "./pdfjs/standard_fonts/",
+          isEvalSupported: false,
+          useSystemFonts: true,
+        };
+      }
 
+      let loadingTask = pdfjsLib.getDocument(docOpts);
       try {
         pdfDoc = await loadingTask.promise;
       } catch (err) {
         if (err && (err.name === "PasswordException" || /password/i.test(String(err.message || "")))) {
+          rawRevokeURL(objectUrl); objectUrl = null;
           const e = new Error("PDF protegido con contraseña");
           e.code = "PASSWORD_REQUIRED";
           throw e;
         }
-        throw err;
+        // Respaldo a buffer si algún entorno restringiera fetch de blob: en Worker
+        if (blobOrBytes instanceof Blob && objectUrl) {
+          rawRevokeURL(objectUrl); objectUrl = null;
+          const bytes = new Uint8Array(await blobOrBytes.arrayBuffer());
+          loadingTask = pdfjsLib.getDocument({
+            data: bytes,
+            standardFontDataUrl: "./pdfjs/standard_fonts/",
+            isEvalSupported: false,
+            useSystemFonts: true,
+          });
+          pdfDoc = await loadingTask.promise;
+        } else {
+          throw err;
+        }
       }
       if (destroyed) {
         pdfDoc.destroy().catch(() => {});
         pdfDoc = null;
+        rawRevokeURL(objectUrl); objectUrl = null;
         return null;
       }
 
       S.pages = pdfDoc.numPages || 1;
       S.page = Math.max(1, Math.min(S.pages, S.page));
 
-      // Leer tamaño de la página 1 de inmediato y usarlo como estimado instantáneo para el resto
       const p1 = await pdfDoc.getPage(1);
       const vp1 = p1.getViewport({ scale: 1, rotation: 0 });
       S.pageDims = Array.from({ length: S.pages }, () => ({ w: vp1.width, h: vp1.height }));
@@ -1337,9 +1631,7 @@
       goToPage(S.page, { instant: true });
       if (opts.onZoomChange) opts.onZoomChange(zoomPercentOf(S.scale));
 
-      // Cargar índice en segundo plano sin bloquear el primer fotograma
       loadOutline().catch(() => {});
-
       return { pages: S.pages, page: S.page };
     }
 
@@ -1354,6 +1646,7 @@
         fitWidth();
       } else {
         applySlotSizes();
+        reportScrollProgress();
         updateVisible(false);
       }
     }
@@ -1363,11 +1656,13 @@
       clearTimeout(renderTimer);
       clearTimeout(hdTimer);
       clearTimeout(zoomAnimTimer);
+      clearTimeout(selTimer);
       if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = 0; }
       S.pinching = false;
       S.animatingZoom = false;
       activeBaseRenders = 0;
       activeHdRenders = 0;
+      activeTextBuilds = 0;
       searchToken++;
       if (cleanupListeners) { cleanupListeners(); cleanupListeners = null; }
       cancelAllRenders();
@@ -1377,11 +1672,15 @@
       S.outline = null;
       S.searchQuery = "";
       S.searchMatches = [];
-      S.selectingPage = 0;
+      S.lastSelectedText = "";
       if (pdfDoc) {
         const d = pdfDoc;
         pdfDoc = null;
         d.destroy().catch(() => {});
+      }
+      if (objectUrl) {
+        rawRevokeURL(objectUrl);
+        objectUrl = null;
       }
       if (host) host.replaceChildren();
       scroller = null;
@@ -1393,6 +1692,7 @@
       close,
       resize,
       goToPage,
+      scrollToFraction,
       stepPage,
       back,
       forward,
@@ -1407,6 +1707,10 @@
       prevMatch: () => jumpToMatch(S.searchPos - 1),
       clearSearch,
       getOutline: () => (S.outline ? Promise.resolve(S.outline) : loadOutline()),
+      getPageBlocks,
+      getPagePlainText,
+      extractTextRange,
+      renderThumbnail,
       clearSelection,
       getSelectedText,
       isOpen: () => !!pdfDoc && !destroyed,
@@ -1422,6 +1726,7 @@
         fitScale: S.fitScale,
         backCount: S.back.length,
         fwdCount: S.fwd.length,
+        lastBackPage: S.back.length ? S.back[S.back.length - 1] : 0,
         pinching: S.pinching,
         hasForms: S.hasForms,
       }),

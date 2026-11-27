@@ -108,8 +108,8 @@ def main() -> None:
         "display": "standalone",
         "orientation": "any",
         "lang": "es",
-        "background_color": "#f4f4f6",
-        "theme_color": "#f4f4f6",
+        "background_color": "#141414",
+        "theme_color": "#141414",
         "icons": [
             {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
             {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png"},

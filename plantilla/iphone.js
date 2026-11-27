@@ -1,5 +1,5 @@
 // PdfCraft para iPhone: pantalla de carga, service worker sin conexión,
-// actualizaciones automáticas y hoja de compartir de iOS.
+// actualizaciones automáticas, adaptación de teclado iOS y hoja de compartir.
 (function () {
   "use strict";
 
@@ -26,9 +26,9 @@
     setStatus("No se pudo abrir PdfCraft");
   }
   function hideSplash() {
-    if (!splash) return;
+    if (!splash || splash.hidden) return;
     splash.classList.add("pc-out");
-    setTimeout(function () { splash.hidden = true; }, 350);
+    setTimeout(function () { splash.hidden = true; }, 340);
   }
   function toast(text, ms) {
     var existing = document.querySelectorAll(".pc-toast");
@@ -38,12 +38,61 @@
     el.setAttribute("role", "status");
     el.textContent = text;
     document.body.appendChild(el);
-    ms = ms || 3400;
+    ms = ms || 3200;
     setTimeout(function () { el.style.opacity = "0"; }, ms);
-    setTimeout(function () { el.remove(); }, ms + 400);
+    setTimeout(function () { el.remove(); }, ms + 380);
   }
   window.pdfcraftToast = toast;
   window.pdfcraftHideSplash = hideSplash;
+
+  // ---------- Sincronización dinámica de la barra de estado del iPhone (<meta name="theme-color">) ----------
+  window.pdfcraftSyncThemeColor = function (inViewer) {
+    try {
+      var html = document.documentElement;
+      var themeAttr = html.getAttribute("data-theme");
+      var isDark = themeAttr === "dark" ||
+        (themeAttr !== "light" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      var color = inViewer ? (isDark ? "#1a1a1c" : "#fafafc") : (isDark ? "#141414" : "#f4f4f6");
+      var metas = document.querySelectorAll('meta[name="theme-color"]');
+      if (!metas.length) {
+        var m = document.createElement("meta");
+        m.name = "theme-color";
+        m.content = color;
+        document.head.appendChild(m);
+      } else {
+        metas.forEach(function (m) {
+          m.removeAttribute("media");
+          m.setAttribute("content", color);
+        });
+      }
+    } catch (e) {}
+  };
+
+  // ---------- Adaptación al teclado virtual del iPhone (visualViewport) ----------
+  (function initVisualViewport() {
+    var vv = window.visualViewport;
+    if (!vv) return;
+    var raf = 0;
+    var lastH = 0;
+    function sync() {
+      raf = 0;
+      var h = Math.round(vv.height);
+      var top = Math.max(0, Math.round(vv.offsetTop));
+      var kbOpen = window.innerHeight - h > 120;
+      document.documentElement.style.setProperty("--pc-vh", h + "px");
+      document.documentElement.style.setProperty("--pc-vtop", top + "px");
+      document.body.classList.toggle("pc-kb-open", kbOpen);
+      if (Math.abs(h - lastH) > 4) {
+        lastH = h;
+        window.dispatchEvent(new CustomEvent("pc:viewport", { detail: { height: h, top: top, keyboard: kbOpen } }));
+      }
+    }
+    function schedule() { if (!raf) raf = requestAnimationFrame(sync); }
+    vv.addEventListener("resize", schedule);
+    vv.addEventListener("scroll", schedule);
+    window.addEventListener("orientationchange", function () { setTimeout(schedule, 160); });
+    sync();
+  })();
 
   window.addEventListener("error", function (e) {
     var t = e && e.target;
@@ -52,11 +101,11 @@
       showError("No se pudo descargar " + (t.src || t.href).split("/").pop() + ".\n" + SIN_RED);
       return;
     }
-    showError((e && e.message) || "Error desconocido al cargar.");
+    if (splash && !splash.hidden) showError((e && e.message) || "Error desconocido al cargar.");
   }, true);
   window.addEventListener("unhandledrejection", function (e) {
     var r = e && e.reason;
-    showError((r && (r.message || String(r))) || "Error desconocido al cargar.");
+    if (splash && !splash.hidden) showError((r && (r.message || String(r))) || "Error desconocido al cargar.");
   });
 
   // --- Service worker ---
@@ -184,6 +233,8 @@
   var blobs = new Map();
   var createURL = URL.createObjectURL.bind(URL);
   var revokeURL = URL.revokeObjectURL.bind(URL);
+  window.__pcRawCreateObjectURL = createURL;
+  window.__pcRawRevokeObjectURL = revokeURL;
   var anchorClick = HTMLAnchorElement.prototype.click;
   var types = {
     pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",

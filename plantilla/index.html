@@ -8,22 +8,22 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="PdfCraft" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="format-detection" content="telephone=no" />
     <meta name="theme-color" content="#f4f4f6" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#141414" media="(prefers-color-scheme: dark)" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
     <link rel="stylesheet" href="./movil.css" />
     <style>
       #pc-splash {
-        position: fixed; inset: 0; z-index: 80; display: flex; flex-direction: column;
+        position: fixed; inset: 0; z-index: 90; display: flex; flex-direction: column;
         align-items: center; justify-content: center; gap: 14px; padding: 24px;
         background: var(--bg); color: var(--fg); transition: opacity .3s ease;
       }
       #pc-splash.pc-out { opacity: 0; pointer-events: none; }
-      #pc-splash img { width: 92px; height: 92px; border-radius: 22px; box-shadow: 0 8px 28px rgba(0,0,0,.18); }
+      #pc-splash img { width: 92px; height: 92px; border-radius: 22px; box-shadow: 0 8px 28px rgba(0,0,0,.22); }
       #pc-splash h1 { margin: 6px 0 0; font-size: 22px; font-weight: 700; letter-spacing: -.015em; }
       #pc-track { width: min(260px, 70vw); height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
       #pc-bar { width: 2%; height: 100%; background: var(--accent); transition: width .15s linear; }
@@ -34,6 +34,8 @@
       (function () {
         try {
           var raw = JSON.parse(localStorage.getItem("pdfcraft-movil") || "{}");
+          if (raw.tema === "oscuro") document.documentElement.setAttribute("data-theme", "dark");
+          else if (raw.tema === "claro") document.documentElement.setAttribute("data-theme", "light");
           var calidad = raw.calidad || "fluida";
           var realDpr = window.devicePixelRatio || 1;
           window.__pdfcraftNativeDpr = realDpr;
@@ -104,53 +106,71 @@
       <div id="pc-error" hidden></div>
     </div>
 
-    <!-- Shell principal (Inicio / Archivos / Herramientas) al estilo de Acrobat para iPhone -->
+    <!-- Shell principal (Inicio / Espacios / Archivos / Buscar / Herramientas) -->
     <section id="pc-home" class="pc-screen" aria-label="Inicio">
       <header class="pc-app-head" id="pc-app-head"></header>
       <main class="pc-tab-body" id="pc-tab-body"></main>
       <button class="pc-create-fab" id="pc-create-fab" type="button" aria-label="Crear o abrir PDF"></button>
-      <nav class="pc-tabbar" id="pc-tabbar" aria-label="Navegación principal"></nav>
+      <nav class="pc-tabbar-wrap" aria-label="Navegación principal">
+        <div class="pc-tabbar" id="pc-tabbar"></div>
+      </nav>
     </section>
 
     <!-- Visor de documento a pantalla completa -->
     <section id="pc-viewer" class="pc-screen" aria-label="Documento">
       <header class="pc-bar pc-top" id="pc-top"></header>
+      <div id="pc-tts-bar" class="pc-tts-bar" hidden></div>
       <div id="pc-doc">
         <canvas id="pdfcraft" data-host="page"></canvas>
         <div id="pc-reader" hidden></div>
+        <div id="pc-liquid" class="pc-liquid" hidden></div>
         <div class="pc-dimmer" id="pc-dimmer" aria-hidden="true"></div>
         <div class="pc-press-ring" id="pc-press-ring" hidden aria-hidden="true"></div>
         <div class="pc-shield" id="pc-shield" hidden></div>
         <div class="pc-busy" id="pc-busy" hidden><div class="pc-spinner"></div><span id="pc-busy-text">Abriendo…</span></div>
 
-        <!-- Barra flotante de navegación / scrubber de páginas -->
-        <div class="pc-scrubber" id="pc-scrubber" hidden>
-          <button class="pc-nav-hist" id="pc-hist-back" type="button" aria-label="Vista anterior" hidden></button>
-          <button class="pc-pill" id="pc-pill" type="button" aria-label="Ir a una página">1 / 1</button>
-          <div class="pc-range-wrap" id="pc-range-wrap">
-            <input type="range" id="pc-range" min="1" max="1" value="1" aria-label="Deslizar entre páginas" />
-          </div>
-          <button class="pc-nav-hist" id="pc-hist-fwd" type="button" aria-label="Vista siguiente" hidden></button>
+        <!-- Aviso flotante de modo (ej. "Toque el documento para añadir texto") -->
+        <div class="pc-mode-hint" id="pc-mode-hint" hidden></div>
+
+        <!-- Botón flotante "Volver a pág. X" cuando se salta con índice/enlace -->
+        <button class="pc-back-jump" id="pc-back-jump" type="button" hidden></button>
+
+        <!-- Navegador vertical deslizable en el borde derecho (idéntico a Acrobat iPhone) -->
+        <div class="pc-vthumb-track" id="pc-vthumb-track" hidden>
+          <button class="pc-vthumb" id="pc-vthumb" type="button" aria-label="Deslizar o ir a una página">1</button>
         </div>
-        <div class="pc-scrub-tip" id="pc-scrub-tip" hidden>Página 1</div>
+        <div class="pc-vthumb-tip" id="pc-vthumb-tip" hidden>Pág. 1 de 1</div>
+
+        <!-- Controles de paso rápido solo en vista Página única -->
+        <div class="pc-single-nav" id="pc-single-nav" hidden>
+          <button class="pc-snav-btn" id="pc-page-prev" type="button" aria-label="Página anterior"></button>
+          <button class="pc-snav-pill" id="pc-page-pill" type="button" aria-label="Ir a página">1 / 1</button>
+          <button class="pc-snav-btn" id="pc-page-next" type="button" aria-label="Página siguiente"></button>
+        </div>
       </div>
 
-      <!-- Barra inferior del visor: o bien la barra principal de Acrobat, o la barra de herramientas del modo activo -->
+      <!-- Barra inferior del visor -->
       <footer class="pc-bar pc-bottom" id="pc-bottom">
+        <button class="pc-bottom-grab" id="pc-bottom-grab" type="button" aria-label="Más herramientas"></button>
         <div class="pc-viewer-nav" id="pc-viewer-nav"></div>
         <div class="pc-toolbar" id="pc-toolbar" hidden></div>
       </footer>
     </section>
+
+    <!-- Vista nativa a pantalla completa de Páginas / Organizar páginas -->
+    <section id="pc-pages-overlay" class="pc-pages-overlay" hidden aria-label="Páginas"></section>
 
     <input type="file" id="pc-file" accept="application/pdf,.pdf" hidden />
     <input type="file" id="pc-files-multi" accept="application/pdf,.pdf" multiple hidden />
     <input type="file" id="pc-img-gallery" accept="image/*" multiple hidden />
     <input type="file" id="pc-img-camera" accept="image/*" capture="environment" hidden />
 
+    <script src="./vendor/pdf-lib.min.js"></script>
     <script src="./iphone.js"></script>
     <script src="./gestos.js"></script>
     <script src="./scanner.js"></script>
     <script src="./lector.js"></script>
+    <script src="./organizar.js"></script>
     <script src="./movil.js"></script>
     <script type="module">
       import init, * as bindings from "./__GLUE__";
