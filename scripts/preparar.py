@@ -86,10 +86,17 @@ def main() -> None:
                 .replace("__WASM__", wasm.name)
                 .replace("__WASM_BYTES__", str(wasm.stat().st_size)))
     (salida / "index.html").write_text(html, encoding="utf-8")
-    # El resto de la plantilla (iphone.js, movil.js, movil.css…) va tal cual.
+    # El resto de la plantilla (iphone.js, movil.js, movil.css, lector.js, pdfjs/…) va tal cual.
     for f in sorted(PLANTILLA.iterdir()):
-        if f.is_file() and f.name not in ("index.html", "sw.js"):
-            shutil.copy2(f, salida / f.name)
+        if f.name in ("index.html", "sw.js"):
+            continue
+        dst = salida / f.name
+        if f.is_dir():
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(f, dst)
+        elif f.is_file():
+            shutil.copy2(f, dst)
 
     manifest = {
         "name": "PdfCraft",

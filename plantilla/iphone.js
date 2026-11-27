@@ -80,12 +80,15 @@
         else toast("Se descargó una actualización de PdfCraft. Se aplicará al volver a Inicio.", 6000);
       }
     });
-    sw.register("./sw.js", { scope: "./" }).then(function (reg) { registration = reg; }).catch(function (e) {
+    sw.register("./sw.js", { scope: "./", updateViaCache: "none" }).then(function (reg) {
+      registration = reg;
+      reg.update().catch(function () {});
+    }).catch(function (e) {
       installFailed = String((e && e.message) || e);
     });
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
     document.addEventListener("visibilitychange", function () {
-      if (document.visibilityState === "visible" && registration && Date.now() - lastUpdateCheck > 30 * 60 * 1000) {
+      if (document.visibilityState === "visible" && registration && Date.now() - lastUpdateCheck > 5 * 60 * 1000) {
         lastUpdateCheck = Date.now();
         registration.update().catch(function () {});
       }

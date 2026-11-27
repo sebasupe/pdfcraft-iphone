@@ -161,8 +161,9 @@
       }
       // Mantener hover_pos en (pg.x0, pg.y0) durante todo el frame para que el zoom ancle ahí
       // y el pan desplace exactamente (panX, panY) al punto final de los dedos.
-      // Quitamos transform solo durante el dispatch síncrono para que eframe lea getBoundingClientRect()
-      // real sin escala CSS, y la restauramos antes del siguiente pintado para evitar parpadeo.
+      // Quitamos transform durante el dispatch síncrono para que eframe lea getBoundingClientRect()
+      // real sin escala CSS, y lo limpiamos en el MISMO frame justo tras el rAF de eframe (1 solo rAF)
+      // para evitar el destello de doble zoom (escala CSS × escala WebGL).
       const savedTransform = canvas.style.transform;
       canvas.style.transform = "";
       ensureFocus();
@@ -170,13 +171,10 @@
       if (zoomed) fire.wheel(pg.x0, pg.y0, 0, -ZOOM_K * Math.log(s), true);
       if (panned) scrollBy(panX, panY, pg.x0, pg.y0);
       canvas.style.transform = savedTransform;
-      // Esperar 2 rAF para quitar la transformación GPU justo después de que PdfCraft pinte el frame nítido.
       pinchClearRaf = requestAnimationFrame(() => {
-        pinchClearRaf = requestAnimationFrame(() => {
-          pinchClearRaf = 0;
-          clearPinchTransform();
-          if (panBuf.dx || panBuf.dy) schedulePan();
-        });
+        pinchClearRaf = 0;
+        clearPinchTransform();
+        if (panBuf.dx || panBuf.dy) schedulePan();
       });
     }
 

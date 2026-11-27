@@ -289,7 +289,28 @@
     orgSelCount: 0,
     scrollHand: false,
     scrollRestoreTimer: null,
+    fastReader: false,
+    readerLayout: "continuous",
+    readerPageGaps: true,
+    readerRotation: 0,
+    uiBooted: false,
   };
+  const reader = window.pdfcraftReader ? window.pdfcraftReader.create() : null;
+  const readerEl = $("pc-reader");
+
+  function setFastReader(on) {
+    const want = !!(on && reader && reader.isOpen());
+    S.fastReader = want;
+    body.classList.toggle("pc-fast-reader", want);
+    if (readerEl) readerEl.hidden = !want;
+  }
+
+  async function ensureEngineReady() {
+    if (S.ready) return true;
+    for (let i = 0; i < 450 && !S.ready; i++) await sleep(100);
+    if (!S.ready) throw new Error("El motor de edición aún está iniciando. Intenta de nuevo en unos segundos.");
+    return true;
+  }
 
   // ---------- Eventos del modo anfitrión ----------
   canvas.addEventListener("pdfcraft:ready", (e) => { S.appVersion = (e.detail && e.detail.appVersion) || ""; });
@@ -306,7 +327,10 @@
   function setDirty(dirty) {
     if (!S.doc || S.doc.dirty === dirty) return;
     S.doc.dirty = dirty;
-    if (dirty) S.doc.edited = true;
+    if (dirty) {
+      S.doc.edited = true;
+      S.doc.engineDirtyForReader = true;
+    }
     S.doc.dirtySince = dirty ? Date.now() : 0;
     renderTop();
   }
@@ -319,10 +343,13 @@
     const waiters = S.saveWaiters.filter((w) => w.name === name);
     S.saveWaiters = S.saveWaiters.filter((w) => w.name !== name);
     if (isPdf && !d.saveAs) {
-      const entry = S.doc && S.doc.name === name ? { meta: S.doc.meta } : [...S.docs.values()].find((x) => x.name === name);
+      const entry = (S.doc && S.doc.name === name ? { meta: S.doc.meta } : null)
+        || [...S.docs.values()].find((x) => x.name === name)
+        || (S.lastDocMeta && S.lastDocMeta.nombre === name ? { meta: S.lastDocMeta } : null);
       if (entry) {
         entry.meta.tamano = file.size;
         entry.meta.modificado = Date.now();
+        if (S.doc && S.doc.meta === entry.meta) S.doc.blob = file;
         await files.save(entry.meta, file);
         waiters.forEach((w) => w.resolve(file));
         return;
@@ -380,9 +407,11 @@
 
   async function currentFile() {
     if (!S.doc) return null;
-    if (S.doc.dirty) return saveActive(S.doc.name);
+    if (S.doc.dirty && S.doc.engineLoaded) return saveActive(S.doc.name);
+    if (S.doc.blob) return new File([S.doc.blob], S.doc.meta.nombre, { type: "application/pdf" });
     const blob = await files.blob(S.doc.meta.id);
-    return blob ? new File([blob], S.doc.meta.nombre, { type: "application/pdf" }) : saveActive(S.doc.name);
+    if (blob) return new File([blob], S.doc.meta.nombre, { type: "application/pdf" });
+    return S.doc.engineLoaded ? saveActive(S.doc.name) : null;
   }
 
   async function share(file) {
@@ -399,14 +428,38 @@
   }
   window.pdfcraftOfferShare = offerShare;
 
-  // ---------- Arranque ----------
+  // ---------- Arranque instantáneo de interfaz + motor WASM en segundo plano ----------
   window.pdfcraftHoldSplash = true;
+  async function bootUI() {
+    if (S.uiBooted) return;
+    S.uiBooted = true;
+    initStaticChrome();
+    await reloadLibrary();
+    renderShell();
+    if (window.pdfcraftReader && window.pdfcraftReader.preload) {
+      window.pdfcraftReader.preload().catch(() => {});
+    }
+    const installingOffline = !!(navigator.serviceWorker && window.isSecureContext && !navigator.serviceWorker.controller);
+    if (!installingOffline && window.pdfcraftHideSplash) {
+      window.pdfcraftHideSplash();
+    }
+    document.addEventListener("visibilitychange", () => {
+      syncWakeLock();
+      if (document.visibilityState === "hidden" && S.doc) {
+        saveLastPage();
+        if (S.doc.dirty && S.doc.engineLoaded && !S.modal) saveActive(S.doc.name).catch(() => {});
+      }
+    });
+  }
+  bootUI().catch((e) => console.error("bootUI:", e));
+
   window.addEventListener("TrunkApplicationStarted", () => {
     start().catch((e) => { console.error(e); if (window.pdfcraftHideSplash) window.pdfcraftHideSplash(); });
   });
 
   let gestures = null;
   async function start() {
+    await bootUI();
     for (let i = 0; i < 400 && !pc.ok(); i++) await sleep(50);
     if (!pc.ok()) throw new Error("sin window.pdfcraft");
     for (let i = 0; ; i++) {
@@ -422,11 +475,10 @@
     if (prefs.nombre) quiet(pc.set("author", prefs.nombre));
     if (prefs.tema !== "auto") quiet(pc.run(prefs.tema === "oscuro" ? "view.theme.dark" : "view.theme.light"));
 
-    // Durante el desplazamiento/pellizco en lectura normal se activa "hand" para que PdfCraft
-    // no extraiga capas de texto en cada página que pasa rápido (evita tirones en el hilo WASM).
+    // Durante el desplazamiento/pellizco en lectura normal sobre WASM se activa "hand"
     function enterScrollHand() {
       clearTimeout(S.scrollRestoreTimer);
-      if (!S.doc || S.mode || S.searching || S.tool || S.modal || S.desktop || S.panel) return;
+      if (S.fastReader || !S.doc || S.mode || S.searching || S.tool || S.modal || S.desktop || S.panel) return;
       if (S.scrollHand) return;
       S.scrollHand = true;
       S.toolSetAt = Date.now();
@@ -499,18 +551,8 @@
       onSelectEnd: (x, y, moved) => { if (moved && !S.mode && !S.modal && !S.desktop && !S.panel) showSelectionBar(); },
     });
 
-    initStaticChrome();
-    await reloadLibrary();
-    renderShell();
     if (window.pdfcraftHideSplash) window.pdfcraftHideSplash();
     setInterval(tick, 500);
-    document.addEventListener("visibilitychange", () => {
-      syncWakeLock();
-      if (document.visibilityState === "hidden" && S.doc) {
-        saveLastPage();
-        if (S.doc.dirty && !S.modal) saveActive(S.doc.name).catch(() => {});
-      }
-    });
   }
 
   function showPressRing(clientX, clientY) {
@@ -625,6 +667,7 @@
   // ---------- Estado periódico ----------
   async function tick() {
     if (!S.ready || S.polling || document.visibilityState !== "visible") return;
+    if (S.fastReader) return;
     if (gestures && gestures.busy()) return;
     S.polling = true;
     try {
@@ -656,13 +699,15 @@
         return;
       }
       S.doc.pages = active.pages;
+      if (S.doc.page > active.pages) S.doc.page = active.pages;
+      const inOrg = S.mode === "organizar" || !!(s.active && s.active.organize);
       const curPage = s.active ? s.active.page : 1;
-      if (curPage !== S.doc.page) {
+      if (!inOrg && curPage !== S.doc.page) {
         S.doc.page = curPage;
         if (!S.scrubbing) updateScrubber(curPage, active.pages);
         if (!S.mode && !S.searching && !S.panel) renderTop();
         saveLastPage();
-      } else if (!S.scrubbing) {
+      } else if (!inOrg && !S.scrubbing) {
         updateScrubber(curPage, active.pages);
       }
       setDirty(!!active.dirty);
@@ -855,8 +900,14 @@
 
     $("pc-hist-back").insertAdjacentHTML("afterbegin", icon("arrowLeft"));
     $("pc-hist-fwd").insertAdjacentHTML("afterbegin", icon("arrowRight"));
-    $("pc-hist-back").addEventListener("click", () => pc.run("view.previous_view").catch(() => {}));
-    $("pc-hist-fwd").addEventListener("click", () => pc.run("view.next_view").catch(() => {}));
+    $("pc-hist-back").addEventListener("click", () => {
+      if (S.fastReader && reader) reader.back();
+      else pc.run("view.previous_view").catch(() => {});
+    });
+    $("pc-hist-fwd").addEventListener("click", () => {
+      if (S.fastReader && reader) reader.forward();
+      else pc.run("view.next_view").catch(() => {});
+    });
     $("pc-pill").addEventListener("click", goToPageSheet);
 
     // Scrubber interactivo para saltar rápido por documentos largos (p. ej. libros de 500+ páginas)
@@ -870,9 +921,13 @@
       tip.textContent = "Página " + n;
       tip.hidden = false;
       clearTimeout(scrubTimer);
-      scrubTimer = setTimeout(() => {
-        pc.set("page", String(n)).catch(() => {});
-      }, 90);
+      if (S.fastReader && reader) {
+        reader.goToPage(n, { instant: true });
+      } else {
+        scrubTimer = setTimeout(() => {
+          pc.set("page", String(n)).catch(() => {});
+        }, 90);
+      }
     });
     const finishScrub = () => {
       if (!S.scrubbing) return;
@@ -881,8 +936,12 @@
       clearTimeout(scrubTimer);
       const n = parseInt(range.value, 10) || 1;
       S.navHistoryUsed = true;
-      pc.set("page", String(n)).catch(() => {});
-      if (S.doc) { S.doc.page = n; saveLastPage(); }
+      if (S.fastReader && reader) {
+        reader.goToPage(n, { recordHistory: true, instant: true });
+      } else {
+        pc.set("page", String(n)).catch(() => {});
+      }
+      if (S.doc) { S.doc.page = n; updateScrubber(n, S.doc.pages); saveLastPage(); }
     };
     range.addEventListener("change", finishScrub);
     range.addEventListener("touchend", finishScrub);
@@ -1662,14 +1721,15 @@
   }
 
   async function runCombineInEngine(pdfFiles, outName) {
-    if (!S.ready) { toast("PdfCraft todavía está iniciando"); return; }
     S.combiningAuto = true;
     S.opening = true;
     showViewer();
     renderTop(outName);
     busy(true, "Combinando " + pdfFiles.length + " archivos…");
     try {
+      await ensureEngineReady();
       if (!(await closeAll())) { busy(false); return; }
+      setFastReader(false);
       showViewer();
       busy(true, "Combinando " + pdfFiles.length + " archivos…");
       const before = new Set(((await pc.state()).documents || []).map((d) => d.doc));
@@ -1716,17 +1776,23 @@
       if (!doc) throw new Error("No se pudo generar el PDF combinado.");
       const meta = { id: newId(), nombre: outName, tamano: 0, abierto: Date.now(), modificado: Date.now(), paginas: doc.pages };
       S.docs.set(doc.doc, { meta, name: doc.name });
-      S.doc = { id: doc.doc, meta, name: doc.name, pages: doc.pages, page: 1, dirty: true, dirtySince: Date.now(), edited: true };
+      S.doc = { id: doc.doc, meta, name: doc.name, pages: doc.pages, page: 1, dirty: true, dirtySince: Date.now(), edited: true, engineLoaded: true, engineDirtyForReader: true, blob: null };
       await prepareDocument();
       // Guardar inmediatamente el resultado combinado en IndexedDB
       const saved = await saveActive(doc.name).catch(() => null);
       if (saved) {
         meta.tamano = saved.size;
-        await files.save(meta, new File([saved], outName, { type: "application/pdf" }));
+        const combinedFile = new File([saved], outName, { type: "application/pdf" });
+        S.doc.blob = combinedFile;
+        S.doc.dirty = false;
+        S.doc.engineDirtyForReader = false;
+        await files.save(meta, combinedFile);
+        await openFastReaderForCurrent(1).catch(() => {});
       }
       busy(false);
       renderTop();
-      setTimeout(() => thumbnail(meta), 900);
+      renderBottom();
+      if (!meta.miniatura && !S.fastReader) setTimeout(() => thumbnail(meta), 900);
       toast("PDF combinado listo: " + outName);
     } catch (e) {
       busy(false);
@@ -1741,13 +1807,14 @@
 
   // ---------- Crear PDF en blanco ----------
   async function createBlankPdf() {
-    if (!S.ready) { toast("PdfCraft todavía está iniciando"); return; }
     S.opening = true;
     showViewer();
     renderTop("Nuevo documento.pdf");
     busy(true, "Creando PDF en blanco…");
     try {
+      await ensureEngineReady();
       if (!(await closeAll())) { busy(false); return; }
+      setFastReader(false);
       showViewer();
       busy(true, "Creando PDF en blanco…");
       const before = new Set(((await pc.state()).documents || []).map((d) => d.doc));
@@ -1763,10 +1830,14 @@
       const name = "Documento " + new Date().toLocaleDateString("es", { day: "2-digit", month: "2-digit" }).replace("/", "-") + ".pdf";
       const meta = { id: newId(), nombre: name, tamano: 0, abierto: Date.now(), modificado: Date.now(), paginas: doc.pages };
       S.docs.set(doc.doc, { meta, name: doc.name });
-      S.doc = { id: doc.doc, meta, name: doc.name, pages: doc.pages, page: 1, dirty: true, dirtySince: Date.now(), edited: true };
+      S.doc = { id: doc.doc, meta, name: doc.name, pages: doc.pages, page: 1, dirty: true, dirtySince: Date.now(), edited: true, engineLoaded: true, engineDirtyForReader: true, blob: null };
       await prepareDocument();
       const saved = await saveActive(doc.name).catch(() => null);
-      if (saved) { meta.tamano = saved.size; await files.save(meta, new File([saved], name, { type: "application/pdf" })); }
+      if (saved) {
+        meta.tamano = saved.size;
+        S.doc.blob = new File([saved], name, { type: "application/pdf" });
+        await files.save(meta, S.doc.blob);
+      }
       busy(false);
       renderTop();
       enterMode("comentar");
@@ -1806,28 +1877,93 @@
     openDocument(meta, blob, tool || null);
   }
 
-  // ---------- Visor ----------
-  async function openDocument(meta, blob, tool) {
-    if (!S.ready) { toast("PdfCraft todavía está iniciando"); return; }
-    S.opening = true;
-    S.navHistoryUsed = false;
-    setImmersive(false);
-    showViewer();
-    renderTop(meta.nombre);
-    busy(true, "Abriendo " + meta.nombre + "…");
+  // ---------- Visor (Motor dual: Lector fluido 120fps PDF.js + Editor completo PdfCraft WASM) ----------
+  async function openFastReaderForCurrent(pageNum) {
+    if (!S.doc || !reader || !readerEl || S.doc.readerUnsupported) return false;
+    const blob = S.doc.blob || (await files.blob(S.doc.meta.id));
+    if (!blob) return false;
+    const meta = S.doc.meta;
+    // Mostrar el contenedor antes de abrir para que clientWidth/clientHeight sean reales
+    readerEl.hidden = false;
+    body.classList.add("pc-fast-reader");
+    S.fastReader = true;
     try {
-      if (!(await closeAll())) { busy(false); return; }
-      showViewer();
-      renderTop(meta.nombre);
-      busy(true, "Abriendo " + meta.nombre + "…");
+      const info = await reader.open(readerEl, blob, {
+        page: pageNum || S.doc.page || 1,
+        layout: S.readerLayout,
+        pageGaps: S.readerPageGaps,
+        rotation: S.readerRotation,
+        onPageChange: (pg, total) => {
+          if (!S.doc) return;
+          S.doc.page = pg;
+          S.doc.pages = total;
+          if (!S.scrubbing) updateScrubber(pg, total);
+          if (!S.mode && !S.searching && !S.panel) renderTop();
+          saveLastPage();
+        },
+        onSingleTap: () => {
+          if (!S.doc || S.mode || S.searching || S.modal || S.desktop || S.panel) return;
+          setImmersive(!S.immersive);
+        },
+        onLongPress: (x, y) => {
+          hideSelectionBar();
+          showPressRing(x, y);
+          if (navigator.vibrate) try { navigator.vibrate(14); } catch (e) {}
+        },
+        onSelectionChange: (txt) => {
+          if (txt && S.fastReader && !S.mode && !S.panel && !S.desktop) showSelectionBar();
+          else if (!txt) hideSelectionBar();
+        },
+        onFirstThumb: (dataUrl) => {
+          if (!meta.miniatura && dataUrl) {
+            meta.miniatura = dataUrl;
+            files.putMeta(meta).catch(() => {});
+          }
+        },
+        onFormTap: async (pg) => {
+          if (!S.doc) return;
+          S.doc.page = pg;
+          const ok = await ensureInEngine("Abriendo campo de formulario…");
+          if (ok) toast("Toca el campo para escribir", 2400);
+        },
+      });
+      if (!info) return false;
+      S.doc.pages = info.pages;
+      S.doc.page = info.page;
+      if (meta.paginas !== info.pages) { meta.paginas = info.pages; files.putMeta(meta).catch(() => {}); }
+      updateScrubber(info.page, info.pages);
+      return true;
+    } catch (e) {
+      setFastReader(false);
+      if (e && e.code === "PASSWORD_REQUIRED") S.doc.readerUnsupported = true;
+      throw e;
+    }
+  }
+
+  async function ensureInEngine(msg) {
+    if (!S.doc) return false;
+    const page = (S.fastReader && reader && reader.isOpen()) ? reader.getState().page : (S.doc.page || 1);
+    S.doc.page = page;
+    if (S.doc.engineLoaded && S.doc.id != null) {
+      setFastReader(false);
+      await pc.set("page", String(page)).catch(() => {});
+      return true;
+    }
+    busy(true, msg || "Abriendo herramientas…");
+    try {
+      await ensureEngineReady();
+      if (!(await closeAllEngineDocs())) { busy(false); return false; }
+      const blob = S.doc.blob || (await files.blob(S.doc.meta.id));
+      if (!blob) throw new Error("No se encontró el archivo.");
       const before = new Set(((await pc.state()).documents || []).map((d) => d.doc));
       const bytes = await blob.arrayBuffer();
-      canvas.dispatchEvent(new CustomEvent("pdfcraft:open", { detail: { name: meta.nombre, bytes } }));
+      setFastReader(false);
+      canvas.dispatchEvent(new CustomEvent("pdfcraft:open", { detail: { name: S.doc.meta.nombre, bytes } }));
       const started = Date.now();
       let doc = null;
       let sawPending = false;
       while (!doc) {
-        await sleep(150);
+        await sleep(130);
         const s = await pc.state();
         const fresh = (s.documents || []).find((d) => !before.has(d.doc));
         if (fresh && !fresh.active) { await pc.run("view.next_tab").catch(() => {}); continue; }
@@ -1839,11 +1975,90 @@
         if (!doc && !waitingUser && sawPending && !pending && Date.now() - started > 1500) throw new Error("El archivo no se pudo abrir. ¿Es un PDF válido?");
         if (!doc && !waitingUser && Date.now() - started > 45000) throw new Error("PdfCraft tardó demasiado en abrirlo.");
       }
-      const resumePage = (meta.ultimaPagina && meta.ultimaPagina >= 1 && meta.ultimaPagina <= doc.pages) ? meta.ultimaPagina : 1;
-      S.docs.set(doc.doc, { meta, name: doc.name });
-      S.doc = { id: doc.doc, meta, name: doc.name, pages: doc.pages, page: resumePage, dirty: !!doc.dirty, dirtySince: 0, edited: false };
-      if (meta.paginas !== doc.pages) { meta.paginas = doc.pages; files.putMeta(meta).catch(() => {}); }
-      await prepareDocument(resumePage);
+      S.doc.id = doc.doc;
+      S.doc.name = doc.name;
+      S.doc.pages = doc.pages;
+      S.doc.engineLoaded = true;
+      S.docs.set(doc.doc, { meta: S.doc.meta, name: doc.name });
+      if (S.doc.meta.paginas !== doc.pages) { S.doc.meta.paginas = doc.pages; files.putMeta(S.doc.meta).catch(() => {}); }
+      await prepareDocument(page);
+      busy(false);
+      return true;
+    } catch (e) {
+      busy(false);
+      if (reader && reader.isOpen()) setFastReader(true);
+      toast(e.message || "No se pudo abrir en el editor.", 5000);
+      return false;
+    }
+  }
+
+  async function returnToFastReader() {
+    if (!S.doc || !reader || S.doc.readerUnsupported || S.mode || S.panel || S.desktop || S.modal) return;
+    const curPage = S.doc.page || 1;
+    try {
+      if (S.doc.engineLoaded && (S.doc.dirty || S.doc.engineDirtyForReader)) {
+        busy(true, "Guardando cambios…");
+        const updated = await saveActive(S.doc.name).catch(() => null);
+        busy(false);
+        if (updated) {
+          S.doc.blob = updated;
+          S.doc.dirty = false;
+          S.doc.engineDirtyForReader = false;
+          await openFastReaderForCurrent(curPage);
+          renderTop();
+          renderBottom();
+          return;
+        }
+      }
+      if (reader.isOpen()) {
+        setFastReader(true);
+        reader.goToPage(curPage, { instant: true });
+        renderTop();
+        renderBottom();
+        updateScrubber(curPage, S.doc.pages);
+      } else if (S.doc.blob) {
+        await openFastReaderForCurrent(curPage);
+        renderTop();
+        renderBottom();
+      }
+    } catch (e) {
+      busy(false);
+    }
+  }
+
+  async function openDocument(meta, blob, tool) {
+    S.opening = true;
+    S.navHistoryUsed = false;
+    setImmersive(false);
+    showViewer();
+    renderTop(meta.nombre);
+    busy(true, "Abriendo " + meta.nombre + "…");
+    try {
+      if (!(await closeAll())) { busy(false); return; }
+      showViewer();
+      renderTop(meta.nombre);
+      busy(true, "Abriendo " + meta.nombre + "…");
+      const resumePage = (meta.ultimaPagina && meta.ultimaPagina >= 1) ? meta.ultimaPagina : 1;
+      S.doc = {
+        id: null, meta, name: meta.nombre, pages: meta.paginas || 1, page: resumePage,
+        dirty: false, dirtySince: 0, edited: false, blob, engineLoaded: false, engineDirtyForReader: false, readerUnsupported: false,
+      };
+
+      // Modo lectura ultrarrápida por defecto (PDF.js en Web Worker + scroll nativo 120Hz)
+      let openedFast = false;
+      if (!tool && reader) {
+        try {
+          openedFast = await openFastReaderForCurrent(resumePage);
+        } catch (e) {
+          openedFast = false;
+        }
+      }
+
+      if (!openedFast) {
+        const ok = await ensureInEngine("Abriendo " + meta.nombre + "…");
+        if (!ok) throw new Error("No se pudo abrir el archivo.");
+      }
+
       busy(false);
       renderTop();
       renderBottom();
@@ -1851,11 +2066,13 @@
       if (tool && tool.mode) enterMode(tool.mode);
       else if (tool && tool.cmd) runCommand(tool.cmd, tool.t);
       clearTimeout(S.thumbTimer);
-      if (!meta.miniatura) S.thumbTimer = setTimeout(() => thumbnail(meta), 1100);
+      if (!meta.miniatura && !S.fastReader) S.thumbTimer = setTimeout(() => thumbnail(meta), 1100);
     } catch (e) {
       busy(false);
       toast(e.message || "No se pudo abrir el archivo.", 5000);
       S.doc = null;
+      if (reader) reader.close();
+      setFastReader(false);
       showHome();
     } finally {
       S.opening = false;
@@ -1944,6 +2161,10 @@
   window.addEventListener("resize", () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(async () => {
+      if (S.fastReader && reader && reader.isOpen()) {
+        reader.resize();
+        return;
+      }
       if (!S.ready) return;
       try {
         const s = await pc.state();
@@ -1955,18 +2176,11 @@
           await pc.set("page", String(page));
         }
       } catch (e) {}
-    }, 350);
+    }, 280);
   });
 
-  async function closeAll() {
-    clearTimeout(S.thumbTimer);
-    if (S.restoreSelectNow) S.restoreSelectNow();
-    if (S.panel) await closePanel();
-    if (S.mode) await exitMode();
-    if (S.searching) closeSearch();
-    hideSelectionBar();
-    hideAnnotBar();
-    saveLastPage();
+  async function closeAllEngineDocs() {
+    if (!S.ready || !pc.ok()) return true;
     for (let i = 0; i < 12; i++) {
       const s = await pc.state();
       const active = (s.documents || []).find((d) => d.active);
@@ -1981,19 +2195,39 @@
         }
       }
       try { await pc.run("file.close"); } catch (e) { break; }
-      await sleep(100);
+      await sleep(90);
       S.docs.delete(active.doc);
     }
+    return true;
+  }
+
+  async function closeAll() {
+    clearTimeout(S.thumbTimer);
+    if (S.restoreSelectNow) S.restoreSelectNow();
+    if (S.panel) await closePanel(true);
+    if (S.mode) await exitMode(true);
+    if (S.searching) closeSearch();
+    hideSelectionBar();
+    hideAnnotBar();
+    saveLastPage();
+    if (reader) reader.close();
+    setFastReader(false);
+    if (S.doc && S.doc.engineLoaded) {
+      if (!(await closeAllEngineDocs())) return false;
+    } else if (S.ready && S.docs.size) {
+      if (!(await closeAllEngineDocs())) return false;
+    }
+    if (S.doc && S.doc.meta) S.lastDocMeta = S.doc.meta;
     S.doc = null;
     return true;
   }
 
   async function goHome() {
     const doc = S.doc;
-    const hadChanges = !!(doc && doc.dirty);
+    const hadChanges = !!(doc && doc.dirty && doc.engineLoaded);
     const wasEdited = !!(doc && doc.edited);
-    if (doc && wasEdited && doc.page === 1) await thumbnail(doc.meta);
-    busy(true, hadChanges ? "Guardando…" : "Cerrando…");
+    if (doc && wasEdited && doc.page === 1 && !S.fastReader) await thumbnail(doc.meta);
+    if (hadChanges) busy(true, "Guardando…");
     const ok = await closeAll();
     busy(false);
     if (!ok) return;
@@ -2017,7 +2251,9 @@
   };
 
   async function showHome() {
-    body.classList.remove("pc-in-viewer", "pc-mode", "pc-searching", "pc-immersive", "pc-panel", "pc-organize");
+    body.classList.remove("pc-in-viewer", "pc-mode", "pc-searching", "pc-immersive", "pc-panel", "pc-organize", "pc-fast-reader");
+    if (readerEl) readerEl.hidden = true;
+    S.fastReader = false;
     S.immersive = false;
     S.mode = null;
     S.panel = null;
@@ -2078,14 +2314,28 @@
       const clearBtn = h("button", {
         class: "pc-clear-btn", type: "button", "aria-label": "Limpiar", icon: "close",
         hidden: !input.value,
-        onclick: () => { input.value = ""; S.searchQuery = ""; clearBtn.hidden = true; S.findLabel = ""; renderBottom(); input.focus(); },
+        onclick: () => {
+          input.value = ""; S.searchQuery = ""; clearBtn.hidden = true; S.findLabel = "";
+          if (S.fastReader && reader) reader.clearSearch();
+          renderBottom();
+          input.focus();
+        },
       });
       let timer = null;
-      const find = () => {
+      const find = async () => {
         S.searchQuery = input.value;
-        if (input.value.trim()) pc.set("find", input.value.trim()).catch(() => {});
+        const q = input.value.trim();
+        if (S.fastReader && reader && reader.isOpen()) {
+          if (!q) { reader.clearSearch(); S.findLabel = ""; renderBottom(); return; }
+          S.findLabel = "Buscando…";
+          renderBottom();
+          const res = await reader.search(q).catch(() => null);
+          if (res && S.searching) { S.findLabel = res.label; renderBottom(); }
+          return;
+        }
+        if (q) pc.set("find", q).catch(() => {});
       };
-      input.addEventListener("input", () => { clearBtn.hidden = !input.value; clearTimeout(timer); timer = setTimeout(find, 320); });
+      input.addEventListener("input", () => { clearBtn.hidden = !input.value; clearTimeout(timer); timer = setTimeout(find, 220); });
       input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); clearTimeout(timer); input.blur(); find(); } });
       top.replaceChildren(
         h("label", { class: "pc-search" }, h("span", { icon: "search" }), input, clearBtn),
@@ -2180,7 +2430,8 @@
     S.findLabel = "";
     S.searchQuery = "";
     body.classList.remove("pc-searching");
-    if (sendEscape !== false && S.last && S.last.active && S.last.active.find_open) pc.key("Escape").catch(() => {});
+    if (S.fastReader && reader) reader.clearSearch();
+    if (!S.fastReader && sendEscape !== false && S.last && S.last.active && S.last.active.find_open) pc.key("Escape").catch(() => {});
     renderTop();
     renderBottom();
     if (S.doc) updateScrubber(S.doc.page, S.doc.pages);
@@ -2204,6 +2455,11 @@
   }
 
   async function findStep(forward) {
+    if (S.fastReader && reader && reader.isOpen()) {
+      const res = forward ? reader.nextMatch() : reader.prevMatch();
+      if (res) { S.findLabel = res.label; renderBottom(); }
+      return;
+    }
     const b = forward ? S.findNext : S.findPrev;
     if (!b) return;
     try {
@@ -2217,10 +2473,11 @@
   async function openPanel(panelName) {
     if (!S.doc) return;
     setImmersive(false);
-    if (S.mode) await exitMode();
+    if (S.mode) await exitMode(true);
     if (S.searching) closeSearch();
     hideSelectionBar();
     hideAnnotBar();
+    if (!(await ensureInEngine("Abriendo panel…"))) return;
     S.panel = panelName;
     body.classList.add("pc-panel");
     renderTop();
@@ -2240,7 +2497,7 @@
     }
   }
 
-  async function closePanel() {
+  async function closePanel(skipReturnReader) {
     if (!S.panel) return;
     S.panel = null;
     body.classList.remove("pc-panel");
@@ -2259,16 +2516,26 @@
       layoutCanvas(await pc.state());
       await fitWidth();
       if (S.doc) updateScrubber(S.doc.page, S.doc.pages);
+      if (!skipReturnReader) await returnToFastReader();
     } catch (e) {}
   }
 
-  // ---------- Marcadores (Mis marcadores + Índice del PDF) ----------
+  // ---------- Marcadores (Mis marcadores + Índice instantáneo del PDF) ----------
   function bookmarksSheet() {
     if (!S.doc) return;
     const meta = S.doc.meta;
     meta.marcadores = meta.marcadores || [];
     const curPage = S.doc.page || 1;
     const listWrap = h("div");
+    const outlineWrap = h("div");
+
+    const jumpTo = (pg, close) => {
+      S.navHistoryUsed = true;
+      if (S.fastReader && reader && reader.isOpen()) reader.goToPage(pg, { recordHistory: true, instant: true });
+      else pc.set("page", String(pg)).catch(() => {});
+      if (S.doc) { S.doc.page = pg; updateScrubber(pg, S.doc.pages); saveLastPage(); }
+      close();
+    };
 
     const draw = (close) => {
       const bms = (meta.marcadores || []).slice().sort((a, b) => a.pagina - b.pagina);
@@ -2277,12 +2544,8 @@
           h("div", { icon: "bookmark" }),
           h("div", { text: "Aún no tienes marcadores guardados en este documento." })));
       } else {
-        listWrap.replaceChildren(h("div", { class: "pc-list" }, bms.map((bm, i) => h("div", { class: "pc-bm-item" },
-          h("button", { class: "pc-bm-go", type: "button", onclick: () => {
-            S.navHistoryUsed = true;
-            pc.set("page", String(bm.pagina)).catch(() => {});
-            close();
-          } },
+        listWrap.replaceChildren(h("div", { class: "pc-list" }, bms.map((bm) => h("div", { class: "pc-bm-item" },
+          h("button", { class: "pc-bm-go", type: "button", onclick: () => jumpTo(bm.pagina, close) },
             h("span", { class: "pc-bm-page", text: "P. " + bm.pagina }),
             h("span", { class: "pc-bm-title", text: bm.titulo })),
           h("button", { class: "pc-recent-more", type: "button", "aria-label": "Eliminar marcador", icon: "trash", onclick: async () => {
@@ -2322,8 +2585,9 @@
         });
         return [
           addBtn,
+          outlineWrap,
           list([
-            { i: "listView", t: "Ver índice / tabla de contenidos del PDF", small: "Capítulos", run: () => { c(); openPanel("bookmarks"); } },
+            { i: "listView", t: "Abrir panel de índice de PdfCraft", small: "Capítulos", run: () => { c(); openPanel("bookmarks"); } },
           ]),
           h("div", { class: "pc-label", text: "Mis marcadores" }),
           listWrap,
@@ -2331,6 +2595,17 @@
       },
     });
     draw(close);
+    if (reader && reader.isOpen()) {
+      reader.getOutline().then((items) => {
+        if (!items || !items.length || !outlineWrap.isConnected) return;
+        outlineWrap.replaceChildren(
+          h("div", { class: "pc-label", text: "Índice del documento" }),
+          h("div", { class: "pc-list" }, items.slice(0, 80).map((it) => h("div", { class: "pc-bm-item", style: it.depth ? ("padding-left:" + (12 + it.depth * 16) + "px") : null },
+            h("button", { class: "pc-bm-go", type: "button", onclick: () => jumpTo(it.page, close) },
+              h("span", { class: "pc-bm-page", text: "P. " + it.page }),
+              h("span", { class: "pc-bm-title", text: it.title }))))));
+      }).catch(() => {});
+    }
   }
 
   // ---------- Modos de herramientas ----------
@@ -2432,11 +2707,12 @@
     if (!m || !S.doc) return;
     if (S.restoreSelectNow) S.restoreSelectNow();
     setImmersive(false);
-    if (S.panel) await closePanel();
-    if (S.mode) await exitMode();
+    if (S.panel) await closePanel(true);
+    if (S.mode) await exitMode(true);
     if (S.searching) closeSearch();
     hideSelectionBar();
     hideAnnotBar();
+    if (!(await ensureInEngine("Preparando " + m.titulo + "…"))) return;
     S.mode = name;
     S.modeEnteredAt = Date.now();
     S.tool = null;
@@ -2452,7 +2728,7 @@
     } catch (e) { toast(e.message); }
   }
 
-  async function exitMode() {
+  async function exitMode(skipReturnReader) {
     const m = MODES[S.mode];
     S.mode = null;
     S.tool = null;
@@ -2462,9 +2738,12 @@
     renderBottom();
     try {
       if (m && m.salir) await m.salir();
-      await pc.set("quick", BASE_TOOL);
-      await applyScale();
+      if (S.ready && pc.ok()) {
+        await pc.set("quick", BASE_TOOL);
+        await applyScale();
+      }
       if (S.doc) updateScrubber(S.doc.page, S.doc.pages);
+      if (!skipReturnReader) await returnToFastReader();
     } catch (e) {}
   }
 
@@ -2545,6 +2824,12 @@
 
   async function runCommand(id, label) {
     try {
+      if (S.doc && S.fastReader) {
+        const ok = await ensureInEngine("Preparando " + (label || "herramienta") + "…");
+        if (!ok) return;
+      } else {
+        await ensureEngineReady();
+      }
       await pc.run(id);
     } catch (e) {
       const msg = String(e.message || e);
@@ -2562,13 +2847,24 @@
   function showSelectionBar() {
     hideSelectionBar();
     hideAnnotBar();
-    const mark = (cmd, label) => { hideSelectionBar(); runCommand(cmd, label); };
+    const mark = async (cmd, qTool, label) => {
+      hideSelectionBar();
+      if (S.fastReader && reader) {
+        reader.clearSelection();
+        await enterMode("comentar");
+        const toolObj = MODES.comentar.herramientas.find((t) => t.q === qTool);
+        if (toolObj) useTool(toolObj);
+        toast("Arrastra sobre el texto para " + label.toLowerCase(), 2600);
+        return;
+      }
+      runCommand(cmd, label);
+    };
     selBar = h("div", { class: "pc-selbar", role: "toolbar", "aria-label": "Texto seleccionado" },
       h("button", { type: "button", icon: "copy", onclick: copySelection }, h("span", { text: "Copiar" })),
-      h("button", { type: "button", icon: "highlight", onclick: () => mark("comment.highlight", "Resaltar") }, h("span", { text: "Resaltar" })),
-      h("button", { type: "button", icon: "underline", onclick: () => mark("comment.underline", "Subrayar") }, h("span", { text: "Subrayar" })),
-      h("button", { type: "button", icon: "strike", onclick: () => mark("comment.strikeout", "Tachar") }, h("span", { text: "Tachar" })),
-      h("button", { type: "button", icon: "note", onclick: () => mark("comment.note", "Nota") }, h("span", { text: "Nota" })));
+      h("button", { type: "button", icon: "highlight", onclick: () => mark("comment.highlight", "highlight", "Resaltar") }, h("span", { text: "Resaltar" })),
+      h("button", { type: "button", icon: "underline", onclick: () => mark("comment.underline", "underline", "Subrayar") }, h("span", { text: "Subrayar" })),
+      h("button", { type: "button", icon: "strike", onclick: () => mark("comment.strikeout", "strikeout", "Tachar") }, h("span", { text: "Tachar" })),
+      h("button", { type: "button", icon: "note", onclick: () => mark("comment.note", "note", "Nota") }, h("span", { text: "Nota" })));
     $("pc-doc").append(selBar);
   }
 
@@ -2605,6 +2901,23 @@
   }
   function copySelection() {
     hideSelectionBar();
+    if (S.fastReader && reader) {
+      const text = reader.getSelectedText();
+      reader.clearSelection();
+      if (!text) return;
+      if (writeText) {
+        writeText(text).then(() => toast("Copiado al portapapeles"), () => {
+          sheet({
+            title: "Copiar texto",
+            text: text.length > 180 ? text.slice(0, 180) + "…" : text,
+            build: (close) => [h("button", { class: "pc-primary", type: "button", text: "Copiar", onclick: () => { close(); writeText(text).then(() => toast("Copiado"), () => toast("iOS no permitió copiar")); } })],
+          });
+        });
+      } else {
+        try { document.execCommand("copy"); toast("Copiado al portapapeles"); } catch (e) {}
+      }
+      return;
+    }
     copyWanted = true;
     let fired = false;
     const seen = () => { fired = true; };
@@ -2656,12 +2969,12 @@
   function viewSettingsSheet() {
     if (!S.doc) return;
     hideSelectionBar();
+    const rs = S.fastReader && reader && reader.isOpen() ? reader.getState() : null;
     const a = S.last && S.last.active;
-    const isTwoUp = a && /two/i.test(String(a.layout || ""));
-    const isSingle = a && !isTwoUp && a.continuous === false;
-    const isCont = !isTwoUp && !isSingle;
-    let layoutMode = isTwoUp ? "two" : isSingle ? "single" : "continuous";
-    let pageGaps = !a || a.page_gaps !== false;
+    let layoutMode = rs
+      ? (rs.layout === "two-page" ? "two" : rs.layout === "single" ? "single" : "continuous")
+      : (a && /two/i.test(String(a.layout || "")) ? "two" : a && a.continuous === false ? "single" : "continuous");
+    let pageGaps = rs ? rs.pageGaps : (!a || a.page_gaps !== false);
     let hlFields = true;
 
     const layoutWrap = h("div", { class: "pc-view-cards" });
@@ -2677,6 +2990,11 @@
           layoutMode = id;
           drawLayout();
           const token = id === "two" ? "two-page" : id === "single" ? "single" : "continuous";
+          S.readerLayout = token;
+          if (S.fastReader && reader && reader.isOpen()) {
+            reader.setLayout(token);
+            return;
+          }
           await pc.set("layout", token).catch(() => {});
           await sleep(140);
           await fitWidth().catch(() => {});
@@ -2728,14 +3046,21 @@
           h("div", { class: "pc-slider-row" }, h("span", { icon: "sun", style: "opacity:.45" }), dimSlider, h("span", { icon: "sun" }))),
         h("div", { class: "pc-label", text: "Zoom y rotación" }),
         h("div", { class: "pc-btn-row" },
-          h("button", { class: "pc-secondary", type: "button", text: "Ancho", onclick: () => { close(); fitWidth().catch(() => {}); } }),
-          h("button", { class: "pc-secondary", type: "button", text: "Página", onclick: () => { close(); pc.run("view.fit_one_page").catch(() => {}); } }),
-          h("button", { class: "pc-secondary", type: "button", text: "100 %", onclick: () => { close(); pc.set("zoom", "100").catch(() => {}); } }),
-          h("button", { class: "pc-secondary", type: "button", icon: "rotate", "aria-label": "Rotar vista", onclick: () => { pc.run("view.rotate.cw").catch(() => {}); } })),
+          h("button", { class: "pc-secondary", type: "button", text: "Ancho", onclick: () => { close(); if (S.fastReader && reader) reader.fitWidth(); else fitWidth().catch(() => {}); } }),
+          h("button", { class: "pc-secondary", type: "button", text: "Página", onclick: () => { close(); if (S.fastReader && reader) reader.fitPage(); else pc.run("view.fit_one_page").catch(() => {}); } }),
+          h("button", { class: "pc-secondary", type: "button", text: "100 %", onclick: () => { close(); if (S.fastReader && reader) reader.setZoomPercent(100); else pc.set("zoom", "100").catch(() => {}); } }),
+          h("button", { class: "pc-secondary", type: "button", icon: "rotate", "aria-label": "Rotar vista", onclick: () => { if (S.fastReader && reader) { reader.rotateCw(); S.readerRotation = reader.getState().rotation; } else pc.run("view.rotate.cw").catch(() => {}); } })),
         h("div", { class: "pc-list" },
           makeToggle("Mantener pantalla encendida", () => !!prefs.pantallaActiva, (v) => { prefs.pantallaActiva = v; savePrefs(); syncWakeLock(); }),
-          makeToggle("Espacio entre páginas", () => pageGaps, (v) => { pageGaps = v; pc.set("page-gaps", v ? "on" : "off").catch(() => {}); }),
-          makeToggle("Resaltar campos rellenables", () => hlFields, (v) => { hlFields = v; pc.set("fields", v ? "on" : "off").catch(() => {}); })),
+          makeToggle("Espacio entre páginas", () => pageGaps, (v) => {
+            pageGaps = v; S.readerPageGaps = v;
+            if (S.fastReader && reader) reader.setPageGaps(v);
+            else pc.set("page-gaps", v ? "on" : "off").catch(() => {});
+          }),
+          makeToggle("Resaltar campos rellenables", () => hlFields, (v) => {
+            hlFields = v;
+            if (!S.fastReader) pc.set("fields", v ? "on" : "off").catch(() => {});
+          })),
       ],
     });
   }
@@ -2751,7 +3076,12 @@
       build: (close) => {
         const go = () => {
           const n = Math.max(1, Math.min(S.doc.pages, parseInt(input.value, 10) || 0));
-          if (n) { S.navHistoryUsed = true; pc.set("page", String(n)).catch(() => {}); }
+          if (n) {
+            S.navHistoryUsed = true;
+            if (S.fastReader && reader && reader.isOpen()) reader.goToPage(n, { recordHistory: true, instant: true });
+            else pc.set("page", String(n)).catch(() => {});
+            if (S.doc) { S.doc.page = n; updateScrubber(n, S.doc.pages); saveLastPage(); }
+          }
           close();
         };
         input.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
@@ -2852,7 +3182,7 @@
           { i: "desktop", t: "Interfaz completa (PC)", small: "Modo escritorio", run: () => { close(); setDesktop(true); } },
         ]),
         h("p", {
-          text: "PdfCraft para iPhone · Motor de código abierto (github.com/storytold/pdfcraft). Tus documentos nunca salen de tu teléfono." +
+          text: "PdfCraft para iPhone v2.1 (Lector fluido PDF.js + Editor PdfCraft). Tus documentos nunca salen de tu teléfono." +
             (S.appVersion ? " Motor " + S.appVersion + "." : ""),
         }),
       ],
@@ -2862,16 +3192,20 @@
   // ---------- Modo escritorio completo ----------
   let backButton = null;
   async function setDesktop(on) {
-    if (!S.ready) return;
-    if (on && S.panel) await closePanel();
-    if (on && S.mode) await exitMode();
+    try { await ensureEngineReady(); } catch (e) { toast(e.message); return; }
+    if (on && S.panel) await closePanel(true);
+    if (on && S.mode) await exitMode(true);
     if (on && S.searching) closeSearch();
     setImmersive(false);
     hideSelectionBar();
     hideAnnotBar();
+    if (on && S.doc && S.fastReader) {
+      if (!(await ensureInEngine("Abriendo modo completo…"))) return;
+    }
     S.desktop = on;
     body.classList.toggle("pc-desktop", on);
     if (on) {
+      setFastReader(false);
       showViewer();
       backButton = backButton || h("button", { class: "pc-back-mobile", type: "button", text: "Volver a vista móvil", onclick: () => setDesktop(false) });
       body.append(backButton);
@@ -2888,6 +3222,7 @@
         if (!active) { S.doc = null; showHome(); return; }
         if (S.doc && active.doc === S.doc.id) {
           await prepareDocument();
+          await returnToFastReader();
           renderTop();
           renderBottom();
         }
@@ -2941,6 +3276,7 @@
     openSearch,
     closeSearch,
     goHome,
+    reader: () => reader,
     state: () => S,
   };
 })();
