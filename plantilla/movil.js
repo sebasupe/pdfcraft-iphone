@@ -333,6 +333,11 @@
     const want = !!(on && reader && reader.isOpen());
     S.fastReader = want;
     body.classList.toggle("pc-fast-reader", want);
+    if (want) {
+      // Jamás dejar un diálogo/modal viejo del motor WASM ocultando las barras del lector rápido
+      S.modal = false;
+      body.classList.remove("pc-modal");
+    }
     if (readerEl) readerEl.hidden = !want || S.liquidMode;
   }
 
@@ -760,10 +765,10 @@
     }
   }
 
-  // ---------- Sondeo periódico del motor WASM (inactivo mientras corre Lector Rápido) ----------
+  // ---------- Sondeo periódico del motor WASM (inactivo fuera del visor o en Lector Rápido) ----------
   async function tick() {
     if (!S.ready || S.polling || document.visibilityState !== "visible") return;
-    if (S.fastReader || (window.pdfcraftOrganizer && window.pdfcraftOrganizer.isOpen())) return;
+    if (!body.classList.contains("pc-in-viewer") || S.fastReader || S.opening || (window.pdfcraftOrganizer && window.pdfcraftOrganizer.isOpen())) return;
     if (gestures && gestures.busy()) return;
     S.polling = true;
     try {
@@ -944,6 +949,12 @@
       if (S.fastReader && reader) reader.back();
       else pc.run("view.previous_view").catch(() => {});
     });
+
+    const immExit = $("pc-imm-exit");
+    if (immExit) {
+      immExit.replaceChildren(h("span", { icon: "back" }), h("span", { text: "Controles" }));
+      immExit.addEventListener("click", () => setImmersive(false));
+    }
 
     // Arrastre vertical de la pestaña derecha de páginas (exacto a Acrobat iOS)
     const track = $("pc-vthumb-track");
@@ -2128,9 +2139,11 @@
     const file = $("pc-file").files && $("pc-file").files[0];
     if (!file) return;
     const meta = { id: newId(), nombre: file.name || "documento.pdf", tamano: file.size, abierto: Date.now(), modificado: file.lastModified || Date.now() };
-    try { await files.save(meta, file); } catch (e) { toast("Se abrirá sin copia local."); }
-    if (pendingTool && pendingTool.addToSpaceId) {
-      const sp = S.cachedSpaces.find((x) => x.id === pendingTool.addToSpaceId);
+    const tool = pendingTool;
+    pendingTool = null;
+    if (tool && tool.addToSpaceId) {
+      try { await files.save(meta, file); } catch (e) { toast("Sin espacio suficiente para copia local."); }
+      const sp = S.cachedSpaces.find((x) => x.id === tool.addToSpaceId);
       if (sp) {
         sp.archivos = (sp.archivos || []).concat(meta.id);
         sp.modificado = Date.now();
@@ -2139,12 +2152,16 @@
         renderSpacesTab();
         toast("Añadido a «" + sp.nombre + "»");
       }
-      pendingTool = null;
       return;
     }
-    const tool = pendingTool;
-    pendingTool = null;
+    // Abrir primero al instante (crítico para libros de 100–380 MB) y guardar copia en segundo plano sin competir por I/O
     openDocument(meta, file, tool);
+    const saveDelay = file.size > 20 * 1024 * 1024 ? 1800 : 0;
+    setTimeout(() => {
+      files.save(meta, file).then(() => reloadLibrary()).catch(() => {
+        toast("Libro abierto en lectura directa (muy grande para copia local).", 3600);
+      });
+    }, saveDelay);
   });
 
   async function openRecent(meta, tool) {
@@ -2162,6 +2179,8 @@
     if (!blob) return false;
     const meta = S.doc.meta;
     readerEl.hidden = S.liquidMode;
+    S.modal = false;
+    body.classList.remove("pc-modal", "pc-desktop", "pc-panel");
     body.classList.add("pc-fast-reader");
     S.fastReader = true;
     try {
@@ -2170,6 +2189,7 @@
         layout: S.readerLayout,
         pageGaps: S.readerPageGaps,
         rotation: S.readerRotation,
+        isImmersive: () => S.immersive,
         onPageChange: (pg, total) => {
           if (!S.doc) return;
           S.doc.page = pg;
@@ -2187,8 +2207,10 @@
         },
         onSelectionChange: (txt) => {
           S.lastSelectionText = txt || "";
-          if (txt && S.fastReader && !S.mode && !S.panel && !S.desktop) showSelectionBar();
-          else if (!txt) hideSelectionBar();
+          if (txt && S.fastReader && !S.mode && !S.panel && !S.desktop) {
+            if (S.immersive) setImmersive(false);
+            showSelectionBar();
+          } else if (!txt) hideSelectionBar();
         },
         onFirstThumb: (dataUrl) => {
           if (!meta.miniatura && dataUrl) {
@@ -2301,6 +2323,8 @@
 
   async function openDocument(meta, blob, tool) {
     S.opening = true;
+    S.modal = false;
+    body.classList.remove("pc-modal", "pc-desktop", "pc-panel", "pc-immersive");
     setImmersive(false);
     setLiquidMode(false);
     stopTts();
@@ -2525,11 +2549,11 @@
   };
 
   async function showHome() {
-    body.classList.remove("pc-in-viewer", "pc-mode", "pc-searching", "pc-immersive", "pc-panel", "pc-fast-reader", "pc-pages-open");
+    body.classList.remove("pc-in-viewer", "pc-mode", "pc-searching", "pc-immersive", "pc-panel", "pc-fast-reader", "pc-pages-open", "pc-modal", "pc-desktop");
     if (window.pdfcraftSyncThemeColor) window.pdfcraftSyncThemeColor(false);
     if (readerEl) readerEl.hidden = true;
     if (liquidEl) { liquidEl.hidden = true; liquidEl.replaceChildren(); }
-    S.fastReader = false; S.liquidMode = false; S.immersive = false;
+    S.fastReader = false; S.liquidMode = false; S.immersive = false; S.modal = false; S.desktop = false;
     S.mode = null; S.panel = null; S.searching = false; S.selectedAnnot = null;
     stopTts();
     syncWakeLock();
@@ -3751,7 +3775,7 @@
           { i: "refresh", t: "Buscar actualizaciones", run: () => { close(); if (window.pdfcraftCheckUpdate) window.pdfcraftCheckUpdate(); } },
           { i: "desktop", t: "Interfaz completa (PC)", small: "Escritorio", run: () => { close(); setDesktop(true); } },
         ]),
-        h("p", { text: "PdfCraft para iPhone v3.0 · Lector PDF.js (streaming para libros grandes), Organizar nativo pdf-lib y Editor PdfCraft. 100 % local." + (S.appVersion ? " Motor " + S.appVersion + "." : "") }),
+        h("p", { text: "PdfCraft para iPhone v3.1 · Lector PDF.js con streaming por rangos (libros de 400+ MB), TextLayer oficial iOS, Organizar nativo pdf-lib y Editor PdfCraft. 100 % local." + (S.appVersion ? " Motor " + S.appVersion + "." : "") }),
       ],
     });
   }
@@ -3847,6 +3871,8 @@
     getState: () => ({
       tab: S.tab, fastReader: S.fastReader, liquidMode: S.liquidMode,
       ttsActive: S.ttsActive, mode: S.mode, ready: S.ready, opening: S.opening,
+      immersive: S.immersive, modal: S.modal,
+      reader: reader && reader.isOpen() ? reader.getState() : null,
       doc: S.doc ? { page: S.doc.page, pages: S.doc.pages, name: S.doc.meta.nombre } : null,
     }),
   };

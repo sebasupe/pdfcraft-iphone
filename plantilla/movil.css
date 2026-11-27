@@ -536,24 +536,24 @@ body.pc-kb-open .pc-bottom { padding-bottom: 4px; }
   backface-visibility: hidden; -webkit-backface-visibility: hidden;
 }
 
-/* Lector rápido PDF.js con selección multipágina continua 100 % nativa */
+/* Lector rápido PDF.js con TextLayer oficial de Mozilla (100 % compatible con Safari iOS) */
 #pc-reader {
   position: absolute; inset: 0; z-index: 1; background: var(--doc-bg);
-  -webkit-user-select: text; user-select: text;
+  -webkit-user-select: auto; user-select: auto;
 }
 body.pc-fast-reader #pdfcraft { visibility: hidden; pointer-events: none; }
 .pc-reader-scroll {
   position: absolute; inset: 0; overflow: auto;
   -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
   touch-action: pan-x pan-y;
-  -webkit-user-select: text; user-select: text;
+  -webkit-user-select: auto; user-select: auto;
 }
 .pc-reader-stage {
   display: flex; flex-direction: column; align-items: center;
   gap: var(--pc-gap, 10px); padding: 8px 0 48px; min-height: 100%;
   box-sizing: border-box;
   backface-visibility: hidden; -webkit-backface-visibility: hidden;
-  -webkit-user-select: text; user-select: text;
+  -webkit-user-select: auto; user-select: auto;
 }
 .pc-reader-stage.pc-layout-single { justify-content: center; padding: 8px 0 60px; }
 .pc-reader-stage.pc-no-gaps { gap: 0; }
@@ -562,7 +562,7 @@ body.pc-fast-reader #pdfcraft { visibility: hidden; pointer-events: none; }
   position: relative; flex: none; background: #ffffff;
   box-shadow: 0 1px 8px rgba(0, 0, 0, 0.24);
   overflow: hidden;
-  -webkit-user-select: text; user-select: text;
+  -webkit-user-select: auto; user-select: auto;
 }
 .pc-reader-stage.pc-no-gaps .pc-page { box-shadow: none; }
 .pc-page-base, .pc-page-hd {
@@ -573,29 +573,41 @@ body.pc-fast-reader #pdfcraft { visibility: hidden; pointer-events: none; }
 .pc-page-hl { position: absolute; inset: 0; pointer-events: none; -webkit-user-select: none; user-select: none; }
 .pc-hl-box { position: absolute; background: rgba(255, 212, 0, 0.44); border-radius: 2px; }
 .pc-hl-box.pc-hl-active { background: rgba(255, 130, 0, 0.56); outline: 1.5px solid rgba(255, 110, 0, 0.92); }
-.pc-page-annots { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+.pc-page-annots { position: absolute; inset: 0; pointer-events: none; z-index: 3; -webkit-user-select: none; user-select: none; }
 .pc-pdf-link, .pc-pdf-field {
   position: absolute; pointer-events: auto; background: transparent; border: 0; padding: 0;
 }
 .pc-pdf-link:active { background: rgba(75, 156, 245, 0.24); border-radius: 3px; }
 .pc-pdf-field { background: rgba(75, 156, 245, 0.12); border: 1px solid rgba(75, 156, 245, 0.42); border-radius: 2px; }
 
-/* Capa de texto SIEMPRE activa y seleccionable a través de páginas (escala uniforme sin redondeo subpíxel) */
+/* Capa de texto oficial PDF.js TextLayer (sin transform:scale en el contenedor, br absolutos sin fondo azul) */
 .pc-text-layer {
-  position: absolute; left: 0; top: 0; z-index: 2; overflow: hidden;
-  transform-origin: 0 0;
-  transform: scale(var(--scale-factor, 1));
+  position: absolute; text-align: initial; inset: 0; overflow: clip; z-index: 2;
+  opacity: 1; line-height: 1;
+  -webkit-text-size-adjust: none; text-size-adjust: none;
+  forced-color-adjust: none; transform-origin: 0 0;
   pointer-events: auto;
   -webkit-user-select: text; user-select: text;
   -webkit-touch-callout: default;
-  line-height: 1; white-space: pre;
 }
-.pc-text-layer span {
-  position: absolute; color: transparent; white-space: pre; line-height: 1;
-  transform-origin: 0 0; cursor: text;
-  -webkit-user-select: text; user-select: text;
+.pc-text-layer :is(span, br) {
+  color: transparent; position: absolute; white-space: pre; cursor: text;
+  transform-origin: 0% 0%;
 }
-.pc-text-layer ::selection { background: rgba(75, 156, 245, 0.36); color: transparent; }
+.pc-text-layer > :not(.markedContent),
+.pc-text-layer .markedContent span:not(.markedContent) { z-index: 1; }
+.pc-text-layer span.markedContent { top: 0; left: 0; height: 0; }
+.pc-text-layer span[role="img"] { -webkit-user-select: none; user-select: none; cursor: default; }
+.pc-text-layer ::selection { background: rgba(75, 156, 245, 0.34); color: transparent; }
+.pc-text-layer br::selection { background: transparent; }
+.pc-text-layer .endOfContent {
+  display: block; position: absolute; inset: 100% 0 0; z-index: 0;
+  cursor: default; -webkit-user-select: none; user-select: none;
+}
+.pc-text-layer[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
+.pc-text-layer[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
+.pc-text-layer[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
+.hiddenCanvasElement { position: absolute; top: 0; left: 0; width: 0; height: 0; display: none; }
 
 /* Modo Líquido (Lectura refluida y copia masiva sin bloqueos) */
 .pc-liquid {
@@ -754,10 +766,25 @@ body.pc-mode .pc-bottom-grab, body.pc-searching .pc-bottom-grab { display: none;
 body.pc-immersive .pc-top { position: absolute; left: 0; right: 0; top: 0; transform: translateY(-100%); opacity: 0; pointer-events: none; }
 body.pc-immersive .pc-bottom { position: absolute; left: 0; right: 0; bottom: 0; transform: translateY(100%); opacity: 0; pointer-events: none; }
 body.pc-immersive .pc-vthumb-track, body.pc-immersive .pc-single-nav { opacity: 0; pointer-events: none; }
-body.pc-modal .pc-top, body.pc-modal .pc-bottom, body.pc-modal .pc-vthumb-track, body.pc-modal .pc-single-nav,
+.pc-imm-exit {
+  display: none; position: fixed; z-index: 12;
+  top: calc(var(--top) + 10px); left: calc(var(--left) + 12px);
+  height: 36px; padding: 0 13px; border-radius: 18px;
+  align-items: center; gap: 6px;
+  background: rgba(24, 24, 28, 0.78); color: #fff; font-size: 13px; font-weight: 650;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+}
+.pc-imm-exit .ic { width: 16px; height: 16px; }
+body.pc-in-viewer.pc-immersive:not(.pc-modal):not(.pc-desktop) .pc-imm-exit { display: inline-flex; }
+
+body.pc-modal:not(.pc-fast-reader) .pc-top,
+body.pc-modal:not(.pc-fast-reader) .pc-bottom,
+body.pc-modal:not(.pc-fast-reader) .pc-vthumb-track,
+body.pc-modal:not(.pc-fast-reader) .pc-single-nav,
 body.pc-desktop .pc-top, body.pc-desktop .pc-bottom, body.pc-desktop .pc-vthumb-track, body.pc-desktop .pc-single-nav { display: none !important; }
 body.pc-panel .pc-bottom, body.pc-panel .pc-vthumb-track, body.pc-panel .pc-single-nav { display: none !important; }
-body.pc-modal #pc-doc { margin-top: var(--top); }
+body.pc-modal:not(.pc-fast-reader) #pc-doc { margin-top: var(--top); }
 body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
 
 .pc-back-mobile {
@@ -771,15 +798,15 @@ body.pc-desktop #pc-doc { margin: var(--top) 0 var(--bottom); }
   position: absolute; z-index: 7; top: 10px; left: 50%; transform: translateX(-50%);
   display: flex; border-radius: 13px; overflow: hidden; background: rgba(24, 24, 28, 0.96);
   border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: var(--shadow); max-width: calc(100% - 20px); overflow-x: auto; scrollbar-width: none;
+  box-shadow: var(--shadow); max-width: calc(100% - 12px); overflow-x: auto; scrollbar-width: none;
   animation: pc-fade .14s ease;
 }
 .pc-selbar::-webkit-scrollbar { display: none; }
 .pc-selbar button {
-  color: #fff; padding: 9px 8px; font-size: 12.5px; font-weight: 600; white-space: nowrap;
-  display: flex; align-items: center; gap: 3px;
+  color: #fff; padding: 8px 6.5px; font-size: 11.5px; font-weight: 600; white-space: nowrap;
+  display: flex; align-items: center; gap: 3px; flex: none;
 }
-.pc-selbar .ic { width: 14px; height: 14px; }
+.pc-selbar .ic { width: 13px; height: 13px; }
 .pc-selbar button + button { border-left: 1px solid rgba(255, 255, 255, 0.14); }
 .pc-selbar button:active { background: rgba(255, 255, 255, 0.16); }
 .pc-selbar button.pc-danger { color: #ff6b6b; }

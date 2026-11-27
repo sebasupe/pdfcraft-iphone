@@ -208,6 +208,7 @@
     activeSession = null;
     if (s.io) s.io.disconnect();
     if (s.ownPdfDoc) { s.ownPdfDoc.destroy().catch(() => {}); }
+    if (s.ownCleanup) { try { s.ownCleanup(); } catch (e) {} }
     if (s.ownObjUrl) {
       try { (window.__pcRawRevokeObjectURL || URL.revokeObjectURL)(s.ownObjUrl); } catch (e) {}
     }
@@ -282,17 +283,11 @@
         if (reader && reader.isOpen && reader.isOpen() && reader.renderThumbnail) {
           url = await reader.renderThumbnail(item.srcIndex + 1, 240, 0).catch(() => null);
         }
-        if (!url && blob && window.pdfcraftReader && window.pdfcraftReader.preload) {
+        if (!url && blob && window.pdfcraftReader && window.pdfcraftReader.openDocumentFromBlob) {
           if (!S.ownPdfDoc) {
-            const pdfjsLib = await window.pdfcraftReader.preload();
-            S.ownObjUrl = (window.__pcRawCreateObjectURL || URL.createObjectURL)(blob);
-            S.ownPdfDoc = await pdfjsLib.getDocument({
-              url: S.ownObjUrl,
-              standardFontDataUrl: "./pdfjs/standard_fonts/",
-              isEvalSupported: false,
-              useSystemFonts: true,
-              disableAutoFetch: true,
-            }).promise;
+            const opened = await window.pdfcraftReader.openDocumentFromBlob(blob);
+            S.ownPdfDoc = opened.doc;
+            S.ownCleanup = opened.cleanup;
           }
           if (S.ownPdfDoc && activeSession === S) {
             const pg = await S.ownPdfDoc.getPage(item.srcIndex + 1);
@@ -308,6 +303,7 @@
             await pg.render({ canvasContext: ctx, viewport: vp, intent: "display" }).promise;
             url = c.toDataURL("image/jpeg", 0.75);
             c.width = 0; c.height = 0;
+            try { pg.cleanup(); } catch (e) {}
           }
         }
       }
